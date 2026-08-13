@@ -67,6 +67,20 @@ pub struct FormCheckParams {
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct CardParams {
+    /// Symbol name or path:line.
+    pub query: String,
+    pub repo: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct ClustersParams {
+    /// Similarity threshold (default 0.92).
+    pub threshold: Option<f64>,
+    pub repo: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct SpotActionParams {
     pub advisory_id: String,
     /// accepted | ignored | dismissed
@@ -220,6 +234,40 @@ impl WardMcp {
         match result {
             Ok(r) => ToolEnvelope::ok(r),
             Err(e) => tool_err(format!("form_check failed (fail-open): {e}")),
+        }
+    }
+
+    /// One-page context card for a symbol (M5): definition, callers (lower
+    /// bound), related tests and config references.
+    #[tool(
+        description = "One-page context card for a symbol (M5): definition, callers, related tests, config references."
+    )]
+    fn context_card(&self, Parameters(p): Parameters<CardParams>) -> String {
+        let repo = resolve_repo(p.repo);
+        let cfg = load_config(&repo);
+        let result = (|| -> anyhow::Result<_> {
+            let store = Store::open(&Store::default_path(&repo))?;
+            ward_core::context::context_card(&repo, &store, &cfg, &p.query)
+        })();
+        match result {
+            Ok(r) => ToolEnvelope::ok(r),
+            Err(e) => tool_err(format!("context_card failed (fail-open): {e}")),
+        }
+    }
+
+    /// Offline duplicate clustering for the consolidation workflow (M6).
+    #[tool(
+        description = "Offline duplicate clustering (M6): union-find over simhash similarity with chunked bucketing; returns clusters and consolidation suggestions."
+    )]
+    fn clusters(&self, Parameters(p): Parameters<ClustersParams>) -> String {
+        let repo = resolve_repo(p.repo);
+        let result = (|| -> anyhow::Result<_> {
+            let store = Store::open(&Store::default_path(&repo))?;
+            ward_core::cluster::cluster_duplicates(&store, p.threshold.unwrap_or(0.92))
+        })();
+        match result {
+            Ok(r) => ToolEnvelope::ok(r),
+            Err(e) => tool_err(format!("clusters failed (fail-open): {e}")),
         }
     }
 
