@@ -7,3 +7,4 @@ pub mod config;
 pub mod fingerprint;
 pub mod lang;
 pub mod normalize;
+pub mod store;
