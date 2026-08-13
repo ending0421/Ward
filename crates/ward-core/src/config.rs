@@ -163,6 +163,47 @@ mod tests {
     }
 
     #[test]
+    fn valid_config_loads_without_warning() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "top_k = 3\n[thresholds]\nstrong = 0.95\nweak = 0.85\n",
+        )
+        .unwrap();
+        let (cfg, warn) = WardConfig::load_or_default(&path);
+        assert!(warn.is_none());
+        assert_eq!(cfg.thresholds.strong, 0.95);
+        assert_eq!(cfg.thresholds.weak, 0.85);
+        assert_eq!(cfg.top_k, 3);
+    }
+
+    #[test]
+    fn starter_config_roundtrips() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        write_starter_config(&path).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            raw.contains("thresholds"),
+            "starter config documents sections"
+        );
+        let (cfg, warn) = WardConfig::load_or_default(&path);
+        assert!(warn.is_none(), "starter config must parse: {warn:?}");
+        assert_eq!(cfg.thresholds.strong, 0.92);
+    }
+
+    #[test]
+    fn suppression_treats_bare_pattern_as_contains() {
+        let cfg = WardConfig {
+            suppress: vec!["generated".to_string()],
+            ..Default::default()
+        };
+        assert!(cfg.is_suppressed("src/generated.rs"));
+        assert!(!cfg.is_suppressed("src/clean.rs"));
+    }
+
+    #[test]
     fn malformed_config_falls_back_with_warning() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
