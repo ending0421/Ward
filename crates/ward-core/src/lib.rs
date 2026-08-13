@@ -5,8 +5,10 @@
 
 pub mod config;
 pub mod fingerprint;
+pub mod fresh;
 pub mod git;
 pub mod index;
 pub mod lang;
 pub mod normalize;
+pub mod search;
 pub mod store;
