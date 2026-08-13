@@ -1,0 +1,60 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: test (Rust)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Format
+        run: cargo fmt --check
+      - name: Lint
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Test
+        run: cargo test --workspace
+
+  dogfood-spot:
+    name: dogfood (index + spot on self)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build ward
+        run: cargo build --release -p ward-cli
+      - name: Index self (Ward dogfoods Ward)
+        run: ./target/release/ward index --repo .
+      - name: Spot smoke (must find simhash)
+        run: |
+          ./target/release/ward spot --repo . \
+            --intent "simhash 结构近重复指纹" \
+            --signature "pub fn simhash(features: &[u64]) -> u64" \
+            --json | tee /tmp/spot.json
+          python3 - <<'EOF'
+          import json
+          r = json.load(open("/tmp/spot.json"))
+          assert r["matches"], "dogfood spot must match its own simhash"
+          print("dogfood spot OK:", [(m["path"], m["lines"], m["similarity"]) for m in r["matches"]])
+          EOF
+
+  duplication-baseline:
+    name: duplication baseline (jscpd)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: jscpd baseline (token-level CPD; trend-comparable, not GitClear-absolute)
+        run: |
+          npm install -g jscpd >/dev/null 2>&1 || npm install jscpd >/dev/null 2>&1 || true
+          npx --yes jscpd --mode strict --format console . --reporters console --min-lines 5 || echo "jscpd unavailable on this runner (fail-open)"
