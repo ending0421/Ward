@@ -85,23 +85,23 @@ pub fn tokenize(s: &str) -> Vec<String> {
     let chars: Vec<char> = s.chars().collect();
     let mut out = Vec::new();
     let mut current = String::new();
+    let mut prev_upper = false;
     for (i, &ch) in chars.iter().enumerate() {
         if ch.is_alphanumeric() {
-            if ch.is_uppercase() {
-                let prev_lower = current.chars().last().is_some_and(|c| c.is_lowercase());
-                let next_lower = chars
-                    .get(i + 1)
-                    .is_some_and(|c| c.is_lowercase());
-                let prev_upper = current.chars().last().is_some_and(|c| c.is_uppercase());
-                // Split at word boundaries: "fooBar" → foo|Bar,
-                // "fooBAR" → foo|BAR, "FnMS" → Fn|MS.
-                if !current.is_empty() && (prev_lower || (prev_upper && next_lower)) {
+            if ch.is_uppercase() && !current.is_empty() {
+                let prev_lower = !prev_upper;
+                let next_lower = chars.get(i + 1).is_some_and(|c| c.is_lowercase());
+                // Word boundary: "fooBar" → foo|Bar, "URLParser" → URL|Parser,
+                // "FnMS" → Fn|MS (acronym run stays together).
+                if prev_lower || (prev_upper && next_lower) {
                     out.push(std::mem::take(&mut current));
                 }
             }
             current.push(ch.to_ascii_lowercase());
+            prev_upper = ch.is_uppercase();
         } else if !current.is_empty() {
             out.push(std::mem::take(&mut current));
+            prev_upper = false;
         }
     }
     if !current.is_empty() {
