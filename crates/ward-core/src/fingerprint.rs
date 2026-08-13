@@ -85,6 +85,26 @@ pub fn subtree_features_of(node: &Node) -> Vec<u64> {
     features
 }
 
+/// Subtree-feature multiset of a node excluding one child subtree (the
+/// signature form: declaration minus body). Signature-shaped Spot queries
+/// compare against the signature simhash, not the full-body one.
+pub fn subtree_features_excluding(node: &Node, excluded: Node) -> Vec<u64> {
+    let mut features = Vec::new();
+    collect_features_excluding(node, excluded, &mut features);
+    features
+}
+
+fn collect_features_excluding(node: &Node, excluded: Node, out: &mut Vec<u64>) {
+    if node.id() == excluded.id() {
+        return;
+    }
+    out.push(node_feature(node));
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        collect_features_excluding(&child, excluded, out);
+    }
+}
+
 fn collect_features(node: &Node, out: &mut Vec<u64>) {
     out.push(node_feature(node));
     let mut cursor = node.walk();
@@ -112,6 +132,62 @@ pub fn simhash(features: &[u64]) -> u64 {
         }
     }
     out
+}
+
+/// Signature simhash for a *query* tree: features of the first symbol with
+/// its body excluded.
+///
+/// Two normalization steps make signature-shaped queries comparable to
+/// indexed symbols:
+/// * tolerant parses of signature-only snippets produce a
+///   `function_signature_item` (with `has_error`) — aliased to
+///   `function_item`;
+/// * the root's parent kind is pinned to `source_file`, matching the parent
+///   of indexed top-level symbols.
+pub fn signature_simhash(tree: &Tree) -> Option<u64> {
+    let root = tree.root_node();
+    let mut cursor = root.walk();
+    let node = root.named_children(&mut cursor).next()?;
+    let alias = match node.kind() {
+        "function_signature_item" => Some("function_item"),
+        _ => None,
+    };
+    let body = node.child_by_field_name("body");
+    let mut features = Vec::new();
+    collect_features_alias(&node, Some("source_file"), alias, body, &mut features);
+    Some(simhash(&features))
+}
+
+fn collect_features_alias(
+    node: &Node,
+    parent_kind: Option<&str>,
+    self_alias: Option<&str>,
+    excluded: Option<Node>,
+    out: &mut Vec<u64>,
+) {
+    if Some(node.id()) == excluded.map(|e| e.id()) {
+        return;
+    }
+    let kind = self_alias.unwrap_or_else(|| node.kind());
+    out.push(feature_with_parent(parent_kind, kind, node));
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        collect_features_alias(&child, Some(kind), None, excluded, out);
+    }
+}
+
+fn feature_with_parent(parent_kind: Option<&str>, kind: &str, node: &Node) -> u64 {
+    let mut f = String::with_capacity(64);
+    f.push_str(parent_kind.unwrap_or(""));
+    f.push('|');
+    f.push_str(kind);
+    f.push('|');
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        f.push_str(child.kind());
+        f.push(',');
+    }
+    feature_hash(&f)
 }
 
 /// Hamming distance between two simhashes (0..=64).
@@ -190,5 +266,25 @@ mod tests {
         let b = simhash(&subtree_features(&parse_rust(FN_B).unwrap()));
         assert_eq!(simhash_distance(a, b), simhash_distance(b, a));
         assert!(simhash_similarity(a, a) > 0.999);
+    }
+
+    #[test]
+    fn signature_query_matches_symbol_signature() {
+        // A signature-only query snippet (which tolerant parsing turns into
+        // a `function_signature_item`) must align with the signature simhash
+        // of the full function it came from.
+        let full = "pub fn simhash(features: &[u64]) -> u64 { let mut v = [0i64; 64]; v[0] = 1; let mut o = 0u64; o }";
+        let sig = "pub fn simhash(features: &[u64]) -> u64";
+        let t_full = parse_rust(full).unwrap();
+        let t_sig = parse_rust(sig).unwrap();
+        let sym_node = t_full.root_node().named_child(0).unwrap();
+        let body = sym_node.child_by_field_name("body").unwrap();
+        let sym_sig = simhash(&subtree_features_excluding(&sym_node, body));
+        let q_sim = signature_simhash(&t_sig).unwrap();
+        assert!(
+            simhash_similarity(sym_sig, q_sim) > 0.9,
+            "signature query must align with symbol signature (dist={})",
+            simhash_distance(sym_sig, q_sim)
+        );
     }
 }

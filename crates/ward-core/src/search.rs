@@ -221,9 +221,7 @@ pub fn spot(
     // Layer 1: exact structural equality (L1) when the signature parses.
     let parsed = proposed_signature.and_then(fingerprint::parse_rust);
     let query_struct = parsed.as_ref().map(|t| fingerprint::struct_hash(t));
-    let query_sim = parsed
-        .as_ref()
-        .map(|t| fingerprint::simhash(&fingerprint::subtree_features(t)));
+    let query_sim = parsed.as_ref().and_then(fingerprint::signature_simhash);
 
     if let Some(qs) = &query_struct {
         for sym in symbols
@@ -258,7 +256,9 @@ pub fn spot(
             continue;
         }
         let (kind, sim) = match query_sim {
-            Some(q) => ("near", fingerprint::simhash_similarity(q, sym.simhash)),
+            // Signature-shaped queries compare against the signature
+            // simhash (full-body simhash is for block/body-level checks).
+            Some(q) => ("near", fingerprint::simhash_similarity(q, sym.sig_simhash)),
             // No fingerprint evidence: BM25-only, normalized to [0,1).
             None => ("textual", bm25_score / (bm25_score + 1.0)),
         };
@@ -353,6 +353,7 @@ mod tests {
                 body_hash: "b".into(),
                 struct_hash: "s".into(),
                 simhash: 1,
+                sig_simhash: 1,
                 commit_sha: "c".into(),
             },
             Symbol {
@@ -366,6 +367,7 @@ mod tests {
                 body_hash: "b2".into(),
                 struct_hash: "s2".into(),
                 simhash: 2,
+                sig_simhash: 2,
                 commit_sha: "c".into(),
             },
         ];

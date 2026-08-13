@@ -10,7 +10,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 
 /// Current schema version. Bump on any schema change; mismatches trigger a
 /// full rebuild instead of a migration (rebuild is cheap and always safe).
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 2;
 
 /// One indexed symbol (function / struct / enum / trait / method, …).
 #[derive(Debug, Clone, PartialEq)]
@@ -25,6 +25,9 @@ pub struct Symbol {
     pub body_hash: String,
     pub struct_hash: String,
     pub simhash: u64,
+    /// Simhash over the signature subtree (body excluded) — the comparison
+    /// target for signature-shaped Spot queries.
+    pub sig_simhash: u64,
     pub commit_sha: String,
 }
 
@@ -79,7 +82,8 @@ fn create_schema(conn: &Connection) -> Result<()> {
             end_byte    INTEGER,
             body_hash   TEXT NOT NULL,
             struct_hash TEXT NOT NULL,
-            simhash     INTEGER NOT NULL,   -- u64 bit pattern
+            simhash     INTEGER NOT NULL,   -- u64 bit pattern (full subtree)
+            sig_simhash INTEGER NOT NULL,   -- u64 bit pattern (signature only)
             commit_sha  TEXT NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_symbols_struct ON symbols(struct_hash);
@@ -232,8 +236,8 @@ impl Store {
             tx.execute(
                 "INSERT INTO symbols
                    (file_path, language, name, kind, start_byte, end_byte,
-                    body_hash, struct_hash, simhash, commit_sha)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+                    body_hash, struct_hash, simhash, sig_simhash, commit_sha)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
                 params![
                     s.file_path,
                     s.language,
@@ -244,6 +248,7 @@ impl Store {
                     s.body_hash,
                     s.struct_hash,
                     s.simhash as i64,
+                    s.sig_simhash as i64,
                     s.commit_sha,
                 ],
             )?;
@@ -282,7 +287,7 @@ impl Store {
     pub fn all_symbols(&self) -> Result<Vec<Symbol>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, file_path, language, name, kind, start_byte, end_byte,
-                    body_hash, struct_hash, simhash, commit_sha
+                    body_hash, struct_hash, simhash, sig_simhash, commit_sha
              FROM symbols",
         )?;
         let rows = stmt.query_map([], row_to_symbol)?;
@@ -293,7 +298,7 @@ impl Store {
     pub fn symbols_by_struct_hash(&self, hash: &str) -> Result<Vec<Symbol>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, file_path, language, name, kind, start_byte, end_byte,
-                    body_hash, struct_hash, simhash, commit_sha
+                    body_hash, struct_hash, simhash, sig_simhash, commit_sha
              FROM symbols WHERE struct_hash = ?1",
         )?;
         let rows = stmt.query_map(params![hash], row_to_symbol)?;
@@ -419,6 +424,7 @@ impl Store {
 
 fn row_to_symbol(r: &rusqlite::Row<'_>) -> rusqlite::Result<Symbol> {
     let simhash: i64 = r.get(9)?;
+    let sig_simhash: i64 = r.get(10)?;
     Ok(Symbol {
         id: r.get(0)?,
         file_path: r.get(1)?,
@@ -430,7 +436,8 @@ fn row_to_symbol(r: &rusqlite::Row<'_>) -> rusqlite::Result<Symbol> {
         body_hash: r.get(7)?,
         struct_hash: r.get(8)?,
         simhash: simhash as u64,
-        commit_sha: r.get(10)?,
+        sig_simhash: sig_simhash as u64,
+        commit_sha: r.get(11)?,
     })
 }
 
@@ -450,6 +457,7 @@ mod tests {
             body_hash: format!("b-{name}"),
             struct_hash: format!("s-{name}"),
             simhash: 0xDEAD_BEEF,
+            sig_simhash: 0xBEEF_DEAD,
             commit_sha: "abc123".into(),
         }
     }

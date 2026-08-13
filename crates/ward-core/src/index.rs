@@ -96,6 +96,10 @@ fn symbol_from_node(node: &Node, source: &str) -> Option<Symbol> {
     let name = name_node.utf8_text(source.as_bytes()).ok()?.to_string();
     let body = node.utf8_text(source.as_bytes()).ok()?.to_string();
     let features = fingerprint::subtree_features_of(node);
+    let sig_features = node
+        .child_by_field_name("body")
+        .map(|body| fingerprint::subtree_features_excluding(node, body))
+        .unwrap_or_else(|| features.clone());
     let struct_form = crate::normalize::canonical_form_of(node);
     let mut h = blake3::Hasher::new();
     h.update(struct_form.as_bytes());
@@ -110,6 +114,7 @@ fn symbol_from_node(node: &Node, source: &str) -> Option<Symbol> {
         body_hash: fingerprint::body_hash(&body),
         struct_hash: h.finalize().to_hex().to_string(),
         simhash: fingerprint::simhash(&features),
+        sig_simhash: fingerprint::simhash(&sig_features),
         commit_sha: String::new(), // filled in by the caller
     })
 }
@@ -217,11 +222,10 @@ impl Indexer<'_> {
                 let path = entry.path();
                 let name = entry.file_name();
                 let name = name.to_string_lossy();
-                if name == ".git"
-                    || name == ".ward"
-                    || name == "target"
-                    || name == "node_modules"
-                {
+                // Skip VCS/artifact/workspace dot-directories. Hidden dirs
+                // in general carry no first-party source (.git, .cargo,
+                // .ward, .github, …).
+                if name.starts_with('.') || name == "target" || name == "node_modules" {
                     continue;
                 }
                 let Ok(meta) = entry.metadata() else { continue };
