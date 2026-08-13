@@ -1,0 +1,31 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/ward-core",
+    "crates/ward-cli",
+    "crates/ward-mcp",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+repository = "https://github.com/ending0421/Ward"
+description = "Ward off AI slop: guardrails and verification for AI agent coding"
+
+[workspace.dependencies]
+ward-core = { path = "crates/ward-core" }
+anyhow = "1"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.9"
+clap = { version = "4", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tree-sitter = "0.25"
+tree-sitter-rust = "0.23"
+rusqlite = { version = "0.37", features = ["bundled"] }
+blake3 = "1"
+sha2 = "0.10"
