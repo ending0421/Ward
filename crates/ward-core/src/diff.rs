@@ -161,15 +161,12 @@ fn collect_surface(
                 );
             }
         }
-        if !spec.is_container_kind(node.kind()) {
-            return;
-        }
     }
-    if spec.is_container_kind(node.kind()) {
-        let mut cursor = node.walk();
-        for child in node.named_children(&mut cursor) {
-            collect_surface(&child, source, spec, out);
-        }
+    // Always descend: container-like symbols (classes/interfaces) host
+    // nested symbols in their bodies — the same rule the indexer follows.
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        collect_surface(&child, source, spec, out);
     }
 }
 
@@ -244,7 +241,7 @@ pub fn replay(
 ) -> Result<ReplayReport> {
     let changed_files = git::diff_names(repo, base, head)?
         .into_iter()
-        .filter(|p| p.ends_with(".rs"))
+        .filter(|p| Language::from_path(std::path::Path::new(p)).is_some())
         .collect::<Vec<_>>();
 
     let mut changes = Vec::new();
