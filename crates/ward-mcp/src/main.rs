@@ -36,6 +36,9 @@ pub struct SpotParams {
     pub intent: String,
     /// Optional proposed signature (Rust). Fingerprint evidence requires it.
     pub proposed_signature: Option<String>,
+    /// Optional already-written body — enables block-level fingerprint
+    /// matches (the PostToolUse flow).
+    pub proposed_body: Option<String>,
     /// Repository root; defaults to the daemon's working directory.
     pub repo: Option<String>,
     /// Number of matches to return.
@@ -128,6 +131,7 @@ impl WardMcp {
                 &cfg,
                 &p.intent,
                 p.proposed_signature.as_deref(),
+                p.proposed_body.as_deref(),
             )
         })();
         match result {

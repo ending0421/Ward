@@ -43,6 +43,8 @@ enum Cmd {
         intent: String,
         #[arg(long)]
         signature: Option<String>,
+        #[arg(long)]
+        body: Option<String>,
         #[arg(default_value = ".", long)]
         repo: PathBuf,
         #[arg(long)]
@@ -140,12 +142,20 @@ fn main() -> Result<()> {
         Cmd::Spot {
             intent,
             signature,
+            body,
             repo,
             json,
         } => {
             let cfg = load_config(&repo);
             let store = open_store(&repo)?;
-            let result = search::spot(&repo, &store, &cfg, &intent, signature.as_deref())?;
+            let result = search::spot(
+                &repo,
+                &store,
+                &cfg,
+                &intent,
+                signature.as_deref(),
+                body.as_deref(),
+            )?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&result)?);
             } else {
