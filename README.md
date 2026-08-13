@@ -26,9 +26,9 @@ catalog, metrics with graduation thresholds, competitive analysis — lives in
 | Spec phase | Scope | Status |
 | :--- | :--- | :--- |
 | Phase 0 | M1 Spot prototype on Rust (self-dogfood) | ✅ implemented |
-| Phase 1 | L2 simhash + feedback loop + M2 deterministic layer | ✅ core implemented (block-level fingerprints & embeddings deferred) |
+| Phase 1 | L2 simhash + block-level fingerprints + feedback loop + M2 deterministic layer | ✅ implemented (embeddings/L3 deferred) |
 | Phase 2 | M3 sandbox adjudication + M4 assertions + LLM narration | 🟡 deterministic parts implemented; LLM narration not included (structured fallback only, per F6) |
-| Phase 3 | Kotlin/Swift/Java/OC grammars, M5/M6 | ⏳ grammar registry is ready; grammars not yet compiled in (fail-open skip) |
+| Phase 3 | Kotlin/Swift/Java/OC grammars compiled in, spec-driven extraction | ✅ five grammars + LanguageSpec taxonomy shipped; M5/M6 pending |
 
 ## Quick start
 
@@ -98,6 +98,7 @@ cannot inject context from PreToolUse
 | L0 | `body_hash` — blake3 of raw source | exact clones |
 | L1 | `struct_hash` — hash of the canonical form (identifiers→`ID`, literals→`LIT`, comments dropped) | clones + pure rename + literal substitution |
 | L2 | `sig_simhash` / `simhash` — Charikar simhash over subtree features (DECKARD-inspired variant) | structural near-duplicates; signature-shaped queries align against the signature simhash |
+| Block | sliding statement-window simhashes inside function bodies | in-function duplication (the granularity symbol-level fingerprints cannot see) |
 | L3 | embeddings (not yet compiled in) | semantic clones — recall only, never thresholds |
 
 Pipeline: L1 equality → BM25 recall → L2 simhash ranking → thresholded
@@ -145,7 +146,13 @@ docs/          # the design spec (v0.6.1)
 cargo fmt --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
+cargo llvm-cov --workspace --summary-only   # coverage (requires llvm-tools-preview)
 ```
+
+Test coverage policy: core engine logic (fingerprints, search, replay, spec,
+index, store) is exercised with positive and negative cases per functional
+path — unit tests inside modules plus an end-to-end suite that drives real
+temporary git repositories through the whole pipeline.
 
 ## License
 
