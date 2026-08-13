@@ -291,6 +291,18 @@ impl Store {
         Ok(())
     }
 
+    /// Symbols that mention `name` (reverse index for M5 context cards).
+    /// Returns `(file_path, symbol_name)` pairs.
+    pub fn mentioners(&self, name: &str) -> Result<Vec<(String, String)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT s.file_path, s.name FROM mentions m
+             JOIN symbols s ON s.id = m.symbol_id
+             WHERE m.name = ?1 ORDER BY s.file_path",
+        )?;
+        let rows = stmt.query_map(params![name], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
     /// Count of symbols that mention `name` — the "at least N callers"
     /// lower-bound estimate used by M2 impact analysis.
     pub fn mention_count(&self, name: &str) -> Result<i64> {
