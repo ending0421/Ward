@@ -1,0 +1,182 @@
+name: Release
+
+# Release pipeline — Release-Target driven:
+#   * push of a `v*` tag is the canonical Release Target trigger;
+#   * workflow_dispatch is the manual trigger (derives the tag from the
+#     workspace version in Cargo.toml when run from a branch).
+#
+# Flow: version/tag consistency check → quality gate (same reusable checks
+# that block merges) → 5-target release build matrix → packaging (binaries +
+# LICENSE/README/hooks/examples/docs) → SHA256SUMS → generated Release Notes
+# (conventional-commit grouping) → GitHub Release.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  version-check:
+    name: version & tag consistency
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+      version: ${{ steps.tag.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: tag
+        run: |
+          WORKSPACE_VERSION="$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys; print(json.load(sys.stdin)["packages"][0]["version"])')"
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            TAG="${GITHUB_REF_NAME}"
+            VERSION="${TAG#v}"
+            if [ "$VERSION" != "$WORKSPACE_VERSION" ]; then
+              echo "::error::tag $TAG does not match workspace version $WORKSPACE_VERSION"
+              exit 1
+            fi
+          else
+            # Manual dispatch from a branch: release the workspace version.
+            TAG="v${WORKSPACE_VERSION}"
+            VERSION="$WORKSPACE_VERSION"
+            echo "::notice::workflow_dispatch: releasing $TAG from ${GITHUB_REF_NAME}"
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+  quality:
+    name: quality gate
+    uses: ./.github/workflows/quality.yml
+
+  build:
+    name: build ${{ matrix.target }}
+    needs: [version-check, quality]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            use_cross: false
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            use_cross: true
+          - os: macos-15
+            target: aarch64-apple-darwin
+            use_cross: false
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            use_cross: false
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            use_cross: false
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install cross (Linux aarch64)
+        if: matrix.use_cross
+        uses: taiki-e/install-action@cross
+
+      - name: Build (native)
+        if: ${{ !matrix.use_cross }}
+        run: cargo build --release --target ${{ matrix.target }} -p ward-cli -p ward-mcp
+
+      - name: Build (cross)
+        if: matrix.use_cross
+        run: cross build --release --target ${{ matrix.target }} -p ward-cli -p ward-mcp
+
+      - name: Package (unix)
+        if: runner.os != 'Windows'
+        run: |
+          set -euo pipefail
+          TAG="${{ needs.version-check.outputs.tag }}"
+          TARGET="${{ matrix.target }}"
+          mkdir -p pkg
+          cp "target/$TARGET/release/ward" "target/$TARGET/release/ward-mcp" pkg/
+          cp -R LICENSE README.md hooks examples docs pkg/
+          tar czf "ward-${TAG}-${TARGET}.tar.gz" -C pkg .
+
+      - name: Package (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $tag = "${{ needs.version-check.outputs.tag }}"
+          $target = "${{ matrix.target }}"
+          New-Item -ItemType Directory -Force -Path pkg | Out-Null
+          Copy-Item "target/$target/release/ward.exe" pkg/
+          Copy-Item "target/$target/release/ward-mcp.exe" pkg/
+          Copy-Item -Recurse LICENSE,README.md,hooks,examples,docs pkg/
+          Compress-Archive -Path pkg/* -DestinationPath "ward-${tag}-${target}.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ward-${{ matrix.target }}
+          path: |
+            ward-*.tar.gz
+            ward-*.zip
+          if-no-files-found: error
+
+  release:
+    name: publish GitHub Release
+    needs: [build, version-check]
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Collect artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        run: |
+          cd dist
+          sha256sum ward-* > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Generate release notes
+        run: |
+          scripts/gen-release-notes.sh > dist/NOTES.md
+          head -40 dist/NOTES.md
+
+      - name: Create or update the GitHub Release
+        run: |
+          set -euo pipefail
+          TAG="${{ needs.version-check.outputs.tag }}"
+          cd dist
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "release $TAG exists; uploading assets"
+            gh release upload "$TAG" ward-* SHA256SUMS.txt --clobber
+          else
+            FLAGS="--latest"
+            case "$TAG" in
+              *-*) FLAGS="$FLAGS --prerelease" ;;
+            esac
+            # shellcheck disable=SC2086
+            gh release create "$TAG" ward-* SHA256SUMS.txt \
+              --title "$TAG" \
+              --notes-file NOTES.md \
+              --target "$GITHUB_SHA" \
+              $FLAGS
+          fi
+
+      - name: Summary
+        run: |
+          echo "Released ${{ needs.version-check.outputs.tag }}"
+          echo "Assets:"
+          ls -la dist/
