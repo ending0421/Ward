@@ -4,6 +4,7 @@
 //! (design law P1). Nothing here owns truth and nothing here writes code.
 
 pub mod config;
+pub mod diff;
 pub mod fingerprint;
 pub mod fresh;
 pub mod git;
