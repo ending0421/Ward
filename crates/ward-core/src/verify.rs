@@ -179,8 +179,8 @@ fn outer_report(
     }
 }
 
-fn docker_available() -> bool {
-    Command::new("docker")
+fn docker_available(docker_bin: &str) -> bool {
+    Command::new(docker_bin)
         .args(["info", "--format", "{{.ServerVersion}}"])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -227,8 +227,14 @@ pub fn sandbox_args(config: &WardConfig, repo_abs: &str) -> Vec<String> {
 /// mounted read-only, target/cargo homes on the container's tmpfs, memory
 /// limited. No sandbox → `unknown` (F13), never a fake pass.
 pub fn verify_full(repo: &Path, config: &WardConfig) -> CatchReport {
+    run_sandbox("docker", repo, config)
+}
+
+/// The sandbox runner, with the docker binary injectable (tests use a shim;
+/// no environment mutation, parallel-test safe).
+pub fn run_sandbox(docker_bin: &str, repo: &Path, config: &WardConfig) -> CatchReport {
     let start = Instant::now();
-    if !docker_available() {
+    if !docker_available(docker_bin) {
         return CatchReport {
             verdict: CatchVerdict::Unknown,
             note: "沙箱环境不可用（Docker 缺失/无权限）；仅 CI 可裁决（F13）".into(),
@@ -248,7 +254,7 @@ pub fn verify_full(repo: &Path, config: &WardConfig) -> CatchReport {
         }
     };
     let repo_str = repo_abs.to_string_lossy().into_owned();
-    let mut cmd = Command::new("docker");
+    let mut cmd = Command::new(docker_bin);
     cmd.args(sandbox_args(config, &repo_str));
     let (ok, stdout, stderr) = run_with_timeout(&mut cmd, Duration::from_secs(1800));
     let output_tail = tail(&format!("{stdout}\n{stderr}"), 24);
@@ -303,6 +309,60 @@ mod tests {
         assert!(args.contains(&"--pids-limit".to_string()));
         assert!(args.contains(&"rust:1-bookworm".to_string()));
         assert_eq!(args.last().unwrap(), "cargo test --quiet");
+    }
+
+    #[test]
+    fn docker_shim_covers_pass_fail_and_security_args() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let log = dir.path().join("args.log");
+        let log_s = log.to_string_lossy().into_owned();
+        let script = format!(
+            "#!/bin/sh\nif [ \"$1\" = \"info\" ]; then echo 26.0; exit 0; fi\necho \"$@\" >> {log_s}\nexit {exit_code}\n",
+            exit_code = 0
+        );
+        let bin = dir.path().join("docker");
+        std::fs::write(&bin, &script).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let cfg = WardConfig::default();
+        let r = run_sandbox(bin.to_str().unwrap(), repo.path(), &cfg);
+        assert_eq!(r.verdict, CatchVerdict::Pass, "{}", r.note);
+        let args = std::fs::read_to_string(&log).unwrap();
+        assert!(args.contains("--network none"), "args: {args}");
+        assert!(args.contains(":ro"), "read-only mount: {args}");
+        assert!(!args.contains("docker.sock"), "no socket mount: {args}");
+        assert!(args.contains("--cap-drop ALL"), "caps dropped: {args}");
+
+        // Failure mapping.
+        let fail_bin = dir.path().join("docker-fail");
+        std::fs::write(
+            &fail_bin,
+            "#!/bin/sh\nif [ \"$1\" = \"info\" ]; then echo 26.0; exit 0; fi\nexit 1\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&fail_bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let r2 = run_sandbox(fail_bin.to_str().unwrap(), repo.path(), &cfg);
+        assert_eq!(r2.verdict, CatchVerdict::Fail);
+    }
+
+    #[test]
+    fn docker_unavailable_is_unknown() {
+        let repo = tempfile::tempdir().unwrap();
+        let cfg = WardConfig::default();
+        let r = run_sandbox("/nonexistent/docker", repo.path(), &cfg);
+        assert_eq!(
+            r.verdict,
+            CatchVerdict::Unknown,
+            "F13: no sandbox ⇒ unknown"
+        );
     }
 
     #[test]
