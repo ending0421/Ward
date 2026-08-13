@@ -58,6 +58,11 @@ enum Cmd {
         repo: PathBuf,
         #[arg(long)]
         json: bool,
+        /// Add an LLM narration section (requires WARD_LLM_URL; every
+        /// sentence is anchor-validated, failures fall back to the
+        /// structured list).
+        #[arg(long)]
+        narrate: bool,
     },
     /// Inner-loop lint/type precheck (M3, no Docker)
     CatchRun {
@@ -81,6 +86,25 @@ enum Cmd {
         spec: PathBuf,
         #[arg(long)]
         base: Option<String>,
+        #[arg(default_value = ".", long)]
+        repo: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+    /// One-page context card for a symbol (M5: definition, callers, tests,
+    /// config references)
+    Card {
+        /// Symbol name or path:line
+        query: String,
+        #[arg(default_value = ".", long)]
+        repo: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Offline duplicate clustering for consolidation (M6)
+    Clusters {
+        #[arg(long, default_value_t = 0.92)]
+        threshold: f64,
         #[arg(default_value = ".", long)]
         repo: PathBuf,
         #[arg(long)]
@@ -182,12 +206,17 @@ fn main() -> Result<()> {
             head,
             repo,
             json,
+            narrate,
         } => {
             let cfg = load_config(&repo);
             let store = open_store(&repo)?;
             let report = diff::replay(&repo, &store, &cfg, &base, &head)?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&report)?);
+            } else if narrate {
+                let provider = http_llm_from_env();
+                let out = ward_core::narrate::narrate(&report, provider.as_deref());
+                print!("{out}");
             } else {
                 print!("{}", diff::render_markdown(&report));
             }
@@ -290,6 +319,58 @@ fn main() -> Result<()> {
             }
             let _ = cfg;
         }
+        Cmd::Card { query, repo, json } => {
+            let cfg = load_config(&repo);
+            let store = open_store(&repo)?;
+            let card = ward_core::context::context_card(&repo, &store, &cfg, &query)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&card)?);
+            } else {
+                println!(
+                    "{} ({}) {}:{}",
+                    card.symbol, card.kind, card.path, card.lines
+                );
+                println!("  callers (at least {}):", card.callers.len());
+                for c in card.callers.iter().take(10) {
+                    println!("    {} {}", c.path, c.symbol);
+                }
+                if card.callers.len() > 10 {
+                    println!("    … and {} more", card.callers.len() - 10);
+                }
+                println!("  related tests: {}", card.tests.len());
+                for t in card.tests.iter().take(5) {
+                    println!("    {} {}", t.path, t.symbol);
+                }
+                println!("  config refs: {}", card.config_refs.len());
+                for r in card.config_refs.iter().take(5) {
+                    println!("    {}:{}", r.path, r.line);
+                }
+            }
+        }
+        Cmd::Clusters {
+            threshold,
+            repo,
+            json,
+        } => {
+            let store = open_store(&repo)?;
+            let report = ward_core::cluster::cluster_duplicates(&store, threshold)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!(
+                    "{} clusters ({} pairwise checks, truncated={})",
+                    report.clusters.len(),
+                    report.pairs_checked,
+                    report.truncated
+                );
+                for c in &report.clusters {
+                    println!("  [{}x] {}", c.members.len(), c.suggestion);
+                    for m in c.members.iter().take(4) {
+                        println!("      {} {} ({:.2})", m.path, m.symbol, m.similarity);
+                    }
+                }
+            }
+        }
         Cmd::Action {
             advisory,
             action,
@@ -308,4 +389,41 @@ fn main() -> Result<()> {
 
 fn short(sha: &str) -> String {
     sha.chars().take(8).collect()
+}
+
+/// OpenAI-compatible HTTP provider, configured purely from the environment:
+/// `WARD_LLM_URL` (required), optional `WARD_LLM_KEY` and `WARD_LLM_MODEL`.
+fn http_llm_from_env() -> Option<Box<dyn ward_core::narrate::LlmProvider>> {
+    let url = std::env::var("WARD_LLM_URL").ok()?;
+    Some(Box::new(HttpLlm {
+        url,
+        key: std::env::var("WARD_LLM_KEY").ok(),
+        model: std::env::var("WARD_LLM_MODEL").unwrap_or_else(|_| "default".into()),
+    }))
+}
+
+struct HttpLlm {
+    url: String,
+    key: Option<String>,
+    model: String,
+}
+
+impl ward_core::narrate::LlmProvider for HttpLlm {
+    fn complete(&self, prompt: &str) -> anyhow::Result<String> {
+        let body = serde_json::json!({
+            "model": self.model,
+            "max_tokens": 400,
+            "messages": [{ "role": "user", "content": prompt }],
+        });
+        let mut req = ureq::post(&self.url).header("Content-Type", "application/json");
+        if let Some(key) = &self.key {
+            req = req.header("Authorization", &format!("Bearer {key}"));
+        }
+        let mut resp = req.send_json(&body)?;
+        let parsed: serde_json::Value = resp.body_mut().read_json()?;
+        parsed["choices"][0]["message"]["content"]
+            .as_str()
+            .map(str::to_string)
+            .ok_or_else(|| anyhow::anyhow!("unexpected LLM response shape"))
+    }
 }
