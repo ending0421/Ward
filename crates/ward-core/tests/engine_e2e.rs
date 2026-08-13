@@ -168,6 +168,30 @@ fn index_repo_handles_all_five_languages() {
 }
 
 #[test]
+fn incremental_indexing_skips_unchanged_files() {
+    let repo = TestRepo::new();
+    repo.write("src/lib.rs", "pub fn f() {}\n");
+    repo.write("src/other.rs", "pub fn g() {}\n");
+    repo.commit_all("c1");
+    let first = index::index_repo(repo.path(), &cfg()).unwrap();
+    assert_eq!(first.files_indexed, 2);
+    assert_eq!(first.files_unchanged, 0);
+
+    let second = index::index_repo(repo.path(), &cfg()).unwrap();
+    assert_eq!(second.files_indexed, 0, "nothing changed ⇒ nothing re-parsed");
+    assert_eq!(second.files_unchanged, 2);
+
+    // Touch one file: only that file is re-parsed.
+    let touched = repo.path().join("src/other.rs");
+    let mut content = std::fs::read_to_string(&touched).unwrap();
+    content.push_str("\n");
+    std::fs::write(&touched, content).unwrap();
+    let third = index::index_repo(repo.path(), &cfg()).unwrap();
+    assert_eq!(third.files_indexed, 1);
+    assert_eq!(third.files_unchanged, 1);
+}
+
+#[test]
 fn index_repo_records_freshness_and_sha() {
     let repo = TestRepo::new();
     repo.write("lib.rs", "pub fn f() {}");
