@@ -67,6 +67,22 @@ pub struct FormCheckParams {
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct CompatCheckParams {
+    /// Baseline revision (default HEAD^).
+    pub base: Option<String>,
+    pub repo: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct IntentCheckParams {
+    /// The original user requirement, in natural language.
+    pub requirement: String,
+    pub base: Option<String>,
+    pub head: Option<String>,
+    pub repo: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct CardParams {
     /// Symbol name or path:line.
     pub query: String,
@@ -234,6 +250,51 @@ impl WardMcp {
         match result {
             Ok(r) => ToolEnvelope::ok(r),
             Err(e) => tool_err(format!("form_check failed (fail-open): {e}")),
+        }
+    }
+
+    /// API/ABI compatibility adjudication (M4 outer loop). Rust uses
+    /// cargo-semver-checks; other languages report unknown honestly.
+    #[tool(
+        description = "API/ABI compatibility adjudication against a base rev (M4). Rust uses cargo-semver-checks; other languages report unknown."
+    )]
+    fn compat_check(&self, Parameters(p): Parameters<CompatCheckParams>) -> String {
+        let repo = resolve_repo(p.repo);
+        ToolEnvelope::ok(ward_core::compat::api_compat_check(
+            &repo,
+            &p.base.unwrap_or_else(|| "HEAD^".into()),
+        ))
+    }
+
+    /// Soft intent-drift comparison (M4-b, LLM partition; not executed
+    /// without WARD_LLM_URL).
+    #[tool(
+        description = "Soft intent-drift comparison (M4-b): original requirement vs deterministic change facts. LLM judgment, advisory only; reports 'not executed' without a provider."
+    )]
+    fn intent_check(&self, Parameters(p): Parameters<IntentCheckParams>) -> String {
+        let repo = resolve_repo(p.repo);
+        let cfg = load_config(&repo);
+        let provider = ward_core::llm::http_llm_from_env();
+        let result = (|| -> anyhow::Result<_> {
+            let store = Store::open(&Store::default_path(&repo))?;
+            let head = p
+                .head
+                .clone()
+                .or_else(|| ward_core::git::head_sha(&repo).ok().flatten())
+                .unwrap_or_else(|| "uncommitted".into());
+            ward_core::intent::intent_drift_check(
+                &repo,
+                &store,
+                &cfg,
+                &p.requirement,
+                &p.base.clone().unwrap_or_else(|| "HEAD^".into()),
+                &head,
+                provider.as_deref(),
+            )
+        })();
+        match result {
+            Ok(r) => ToolEnvelope::ok(r),
+            Err(e) => tool_err(format!("intent_check failed (fail-open): {e}")),
         }
     }
 
