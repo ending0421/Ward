@@ -17,6 +17,7 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
 use crate::config::WardConfig;
+use crate::embedding::EmbeddingProvider;
 use crate::fingerprint;
 use crate::lang::RUST;
 use crate::store::{Advisory, Store, Symbol};
@@ -271,11 +272,22 @@ pub fn spot(
             // Signature-shaped queries compare against the signature
             // simhash (full-body simhash is for block/body-level checks).
             Some(q) => ("near", fingerprint::simhash_similarity(q, sym.sig_simhash)),
-            // No fingerprint evidence: BM25-only, normalized to [0,1].
-            // Calibration: a single rare-token hit (df=1 ⇒ idf ≈ ln N/1.5)
-            // must clear the weak band, so the divisor is small. Textual
+            // No fingerprint evidence: BM25 + L3 token-bag supplement,
+            // normalized to [0,1]. Calibration: a single rare-token hit
+            // (df=1 ⇒ idf ≈ ln N/1.5) must clear the weak band. Textual
             // evidence is capped at Weak by the grade rule regardless.
-            None => ("textual", (bm25_score / 1.5).min(1.0)),
+            None => {
+                let bm25_norm = (bm25_score / 1.5).min(1.0);
+                let embedder = crate::embedding::HashingEmbedder::new(128);
+                let supplement = match (
+                    embedder.embed(intent),
+                    embedder.embed(&format!("{} {}", sym.name, sym.kind)),
+                ) {
+                    (Some(q), Some(d)) => crate::embedding::cosine(&q, &d).max(0.0),
+                    _ => 0.0,
+                };
+                ("textual", bm25_norm.max(supplement as f64))
+            }
         };
         if seen.insert(idx) {
             ranked.push((
