@@ -147,6 +147,18 @@ pub fn run_compat(cargo_bin: &str, repo: &Path, base: &str) -> CompatReport {
         .rev()
         .collect::<Vec<_>>()
         .join("\n");
+    // A missing tool is `unknown` (F13 spirit), never a fake fail.
+    let tool_missing = combined.contains("no such command")
+        || combined.contains("could not find")
+        || combined.contains("not installed");
+    if tool_missing {
+        return CompatReport {
+            verdict: CompatVerdict::Unknown,
+            tool: "cargo-semver-checks".into(),
+            detail: format!("工具不可用：{detail}"),
+            duration_ms: start.elapsed().as_millis() as u64,
+        };
+    }
     if out.status.success() {
         CompatReport {
             verdict: CompatVerdict::Pass,
