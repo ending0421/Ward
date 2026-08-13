@@ -203,6 +203,15 @@ mod tests {
     }
 
     #[test]
+    fn public_wrapper_delegates_with_unknown_for_non_rust() {
+        // Covers the api_compat_check wrapper path (non-Rust repo).
+        let dir = tempfile::tempdir().unwrap();
+        let r = api_compat_check(dir.path(), "HEAD^");
+        assert_eq!(r.verdict, CompatVerdict::Unknown);
+        assert!(r.detail.contains("非 Rust"));
+    }
+
+    #[test]
     fn missing_cargo_toml_is_unknown() {
         let dir = tempfile::tempdir().unwrap();
         let r = api_compat_check(dir.path(), "HEAD^");

@@ -654,6 +654,69 @@ mod tests {
     }
 
     #[test]
+    fn blocks_roundtrip_and_mentioners() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(&dir.path().join("index.db")).unwrap();
+        store
+            .replace_blocks(
+                "f.rs",
+                &[Block {
+                    id: None,
+                    file_path: "f.rs".into(),
+                    parent_symbol_id: None,
+                    start_byte: 0,
+                    end_byte: 10,
+                    simhash: 42,
+                    kind: "statement_block".into(),
+                    commit_sha: "c".into(),
+                }],
+            )
+            .unwrap();
+        let blocks = store.all_blocks().unwrap();
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].simhash, 42);
+
+        // Reverse index: mentioners.
+        store
+            .replace_file("f.rs", &[symbol("caller", "fn caller() { debounce() }")])
+            .unwrap();
+        let all = store.all_symbols().unwrap();
+        let id = all[0].id.unwrap();
+        store.set_mentions(id, &["debounce".into()]).unwrap();
+        let mentioners = store.mentioners("debounce").unwrap();
+        assert_eq!(mentioners.len(), 1);
+        assert_eq!(mentioners[0].1, "caller");
+        assert!(store.mentioners("nobody").unwrap().is_empty());
+    }
+
+    #[test]
+    fn advisory_upsert_replaces_previous_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("index.db")).unwrap();
+        let a = Advisory {
+            id: "adv_1".into(),
+            tool: "spot".into(),
+            ts: 1,
+            query_hash: "q1".into(),
+            result_json: "[]".into(),
+            ..Default::default()
+        };
+        store.record_advisory(&a).unwrap();
+        let a2 = Advisory {
+            id: "adv_1".into(),
+            tool: "spot".into(),
+            ts: 2,
+            query_hash: "q2".into(),
+            result_json: "[x]".into(),
+            ..Default::default()
+        };
+        store.record_advisory(&a2).unwrap();
+        // The row was replaced (INSERT OR REPLACE): the action update still
+        // resolves to exactly one row.
+        store.set_agent_action("adv_1", "ignored").unwrap();
+    }
+
+    #[test]
     fn corrupted_database_triggers_f1_rebuild() {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("index.db");

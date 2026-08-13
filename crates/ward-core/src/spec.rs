@@ -325,6 +325,21 @@ assertions:
     }
 
     #[test]
+    fn missing_spec_file_is_an_error() {
+        // Reading a nonexistent spec must fail loudly (the caller decides
+        // how to fail open) — never silently produce an empty spec.
+        assert!(parse_spec_file(std::path::Path::new("/nonexistent/spec.md")).is_err());
+    }
+
+    #[test]
+    fn malformed_yaml_in_spec_is_an_error() {
+        // A yaml fence whose content does not parse must surface as an
+        // error, not a silently empty spec (F12: spec quality matters).
+        let r = parse_spec("```yaml\nassertions: [unclosed\n```\n", "s");
+        assert!(r.is_err(), "malformed yaml must error: {r:?}");
+    }
+
+    #[test]
     fn spec_without_yaml_is_issue_not_error() {
         let spec = parse_spec("# nothing here", "specs/x.md").unwrap();
         assert!(spec.assertions.is_empty());
