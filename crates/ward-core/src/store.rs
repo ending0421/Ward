@@ -222,9 +222,12 @@ impl Store {
     // ---- indexing --------------------------------------------------------
 
     /// Replace every symbol of one file with the newly parsed set.
-    pub fn replace_file(&mut self, file_path: &str, symbols: &[Symbol]) -> Result<()> {
+    /// Returns the inserted row ids in insertion order (used to attach
+    /// per-symbol mention edges).
+    pub fn replace_file(&mut self, file_path: &str, symbols: &[Symbol]) -> Result<Vec<i64>> {
         let tx = self.conn.transaction()?;
         tx.execute("DELETE FROM symbols WHERE file_path = ?1", params![file_path])?;
+        let mut ids = Vec::with_capacity(symbols.len());
         for s in symbols {
             tx.execute(
                 "INSERT INTO symbols
@@ -244,9 +247,10 @@ impl Store {
                     s.commit_sha,
                 ],
             )?;
+            ids.push(tx.last_insert_rowid());
         }
         tx.commit()?;
-        Ok(())
+        Ok(ids)
     }
 
     /// Record identifier mentions for one symbol (static edge lower bound).
