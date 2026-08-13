@@ -18,6 +18,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::WardConfig;
 use crate::fingerprint;
+use crate::lang::RUST;
 use crate::store::{Advisory, Store, Symbol};
 
 /// One advisory match.
@@ -206,6 +207,7 @@ pub fn spot(
     config: &WardConfig,
     intent: &str,
     proposed_signature: Option<&str>,
+    proposed_body: Option<&str>,
 ) -> Result<SpotResult> {
     let symbols = store.all_symbols()?;
     let bm25 = Bm25::build(&symbols);
@@ -220,8 +222,18 @@ pub fn spot(
 
     // Layer 1: exact structural equality (L1) when the signature parses.
     let parsed = proposed_signature.and_then(fingerprint::parse_rust);
-    let query_struct = parsed.as_ref().map(fingerprint::struct_hash);
-    let query_sim = parsed.as_ref().and_then(fingerprint::signature_simhash);
+    let query_struct = parsed.as_ref().and_then(|t| {
+        // Node-level form: the stored struct_hash covers the symbol node,
+        // not the whole tree (whose root wrapper would never match).
+        let root = t.root_node();
+        let mut cursor = root.walk();
+        root.named_children(&mut cursor)
+            .next()
+            .map(|n| fingerprint::struct_hash_of(&n, &RUST))
+    });
+    let query_sim = parsed
+        .as_ref()
+        .and_then(|t| fingerprint::signature_simhash(t, &RUST));
 
     if let Some(qs) = &query_struct {
         for sym in symbols
@@ -259,8 +271,11 @@ pub fn spot(
             // Signature-shaped queries compare against the signature
             // simhash (full-body simhash is for block/body-level checks).
             Some(q) => ("near", fingerprint::simhash_similarity(q, sym.sig_simhash)),
-            // No fingerprint evidence: BM25-only, normalized to [0,1).
-            None => ("textual", bm25_score / (bm25_score + 1.0)),
+            // No fingerprint evidence: BM25-only, normalized to [0,1].
+            // Calibration: a single rare-token hit (df=1 ⇒ idf ≈ ln N/1.5)
+            // must clear the weak band, so the divisor is small. Textual
+            // evidence is capped at Weak by the grade rule regardless.
+            None => ("textual", (bm25_score / 1.5).min(1.0)),
         };
         if seen.insert(idx) {
             ranked.push((
@@ -284,6 +299,48 @@ pub fn spot(
         }
         if matches.len() >= config.top_k {
             break;
+        }
+    }
+
+    // Layer 4: block-level fingerprints (in-function duplication, spec
+    // §3-M1 granularity fix). Only active when the caller provides the
+    // written body (the PostToolUse flow).
+    if let Some(body) = proposed_body {
+        let query_windows = crate::index::block_windows_of_body(body);
+        if !query_windows.is_empty() {
+            let blocks = store.all_blocks()?;
+            let mut block_hits: Vec<(SpotMatch, f64)> = Vec::new();
+            for b in blocks {
+                if config.is_suppressed(&b.file_path) {
+                    continue;
+                }
+                let best = query_windows
+                    .iter()
+                    .map(|q| fingerprint::simhash_similarity(*q, b.simhash))
+                    .fold(0.0f64, f64::max);
+                if best >= config.thresholds.strong {
+                    block_hits.push((
+                        SpotMatch {
+                            path: b.file_path.clone(),
+                            lines: line_range(&repo.join(&b.file_path), b.start_byte, b.end_byte),
+                            symbol: format!("block:{}", b.kind),
+                            similarity: best,
+                            kind: "block".into(),
+                            note: "函数内语句块窗口高度相似（块级指纹）".into(),
+                        },
+                        best,
+                    ));
+                }
+            }
+            block_hits.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            for (m, _) in block_hits {
+                if matches.len() >= config.top_k {
+                    break;
+                }
+                if claimed.insert((m.path.clone(), m.symbol.clone())) {
+                    matches.push(m);
+                }
+            }
         }
     }
 
@@ -340,6 +397,20 @@ mod tests {
     }
 
     #[test]
+    fn tokenize_flushes_on_punctuation_and_underscores() {
+        assert_eq!(
+            tokenize("foo_bar-baz qux"),
+            vec!["foo", "bar", "baz", "qux"]
+        );
+        assert_eq!(
+            tokenize("fn debounce(ms: u64)"),
+            vec!["fn", "debounce", "ms", "u64"]
+        );
+        assert_eq!(tokenize(""), Vec::<String>::new());
+        assert_eq!(tokenize("___"), Vec::<String>::new());
+    }
+
+    #[test]
     fn bm25_ranks_matching_names_first() {
         let syms = vec![
             Symbol {
@@ -374,6 +445,19 @@ mod tests {
         let bm = Bm25::build(&syms);
         let top = bm.recall(&tokenize("debounce leading trailing"), 5);
         assert_eq!(top[0].0, 0);
+    }
+
+    #[test]
+    fn grade_full_matrix() {
+        let cfg = WardConfig::default();
+        // textual: never strong, weak at ≥0.80, filtered below.
+        assert_eq!(grade("textual", 1.0, &cfg), Grade::Weak);
+        assert_eq!(grade("textual", 0.80, &cfg), Grade::Weak);
+        assert_eq!(grade("textual", 0.79, &cfg), Grade::Filtered);
+        // structural/near: three bands.
+        assert_eq!(grade("near", 0.92, &cfg), Grade::Strong);
+        assert_eq!(grade("structural", 0.85, &cfg), Grade::Weak);
+        assert_eq!(grade("near", 0.79, &cfg), Grade::Filtered);
     }
 
     #[test]
