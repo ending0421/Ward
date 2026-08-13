@@ -85,6 +85,39 @@ pub fn canonical_form_of(node: &Node) -> String {
     out
 }
 
+/// Canonical form of a node *excluding* one child subtree (by node id) —
+/// the signature form: the whole declaration minus its `body` field.
+pub fn canonical_form_excluding(node: &Node, excluded: Node) -> String {
+    let mut out = String::new();
+    write_node_excluding(node, excluded, &mut out);
+    out
+}
+
+fn write_node_excluding(node: &Node, excluded: Node, out: &mut String) {
+    if node.id() == excluded.id() {
+        return;
+    }
+    let kind = node.kind();
+    if is_excluded(kind) {
+        return;
+    }
+    if is_identifier_kind(kind) {
+        out.push_str("(ID)");
+        return;
+    }
+    if is_literal_kind(kind) {
+        out.push_str("(LIT)");
+        return;
+    }
+    out.push('(');
+    out.push_str(kind);
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        write_node_excluding(&child, excluded, out);
+    }
+    out.push(')');
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
