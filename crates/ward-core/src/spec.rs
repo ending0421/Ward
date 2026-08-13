@@ -267,6 +267,64 @@ assertions:
     }
 
     #[test]
+    fn yaml_fence_without_lang_tag_works() {
+        let spec = parse_spec("```\nassertions:\n  - kind: must_pass\n```\n", "s").unwrap();
+        assert_eq!(spec.assertions.len(), 1);
+    }
+
+    #[test]
+    fn yml_fence_with_lang_tag_works() {
+        let spec = parse_spec("```yml\nassertions:\n  - kind: must_pass\n```\n", "s").unwrap();
+        assert_eq!(spec.assertions.len(), 1);
+        assert!(spec.issues.is_empty());
+    }
+
+    #[test]
+    fn non_map_assertion_is_issue_not_panic() {
+        let spec = parse_spec("```yaml\nassertions:\n  - just_a_string\n```\n", "s").unwrap();
+        assert!(spec.assertions.is_empty());
+        assert!(!spec.issues.is_empty());
+    }
+
+    #[test]
+    fn assertion_without_kind_is_issue() {
+        let spec = parse_spec("```yaml\nassertions:\n  - suite: x\n```\n", "s").unwrap();
+        assert!(spec.assertions.is_empty());
+        assert!(!spec.issues.is_empty());
+    }
+
+    #[test]
+    fn max_files_changed_without_value_is_unknown() {
+        let changed = vec!["a.rs".to_string()];
+        let a = Assertion {
+            kind: "max_files_changed".into(),
+            path: None,
+            suite: None,
+            value: None,
+        };
+        assert_eq!(evaluate_one(&changed, &a).verdict, Verdict::Unknown);
+    }
+
+    #[test]
+    fn evaluate_with_bad_refs_fails_open_to_empty_diff() {
+        // git diff on bogus refs fails; evaluate treats it as an empty diff
+        // (fail-open) instead of crashing.
+        let repo = tempfile::tempdir().unwrap();
+        let parsed = parse_spec(
+            "```yaml\nassertions:\n  - kind: no_new_dependency\n```",
+            "s",
+        )
+        .unwrap();
+        let results = evaluate(repo.path(), &parsed, "bogus-base", "bogus-head").unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            results[0].verdict,
+            Verdict::Pass,
+            "empty diff passes no_new_dependency"
+        );
+    }
+
+    #[test]
     fn spec_without_yaml_is_issue_not_error() {
         let spec = parse_spec("# nothing here", "specs/x.md").unwrap();
         assert!(spec.assertions.is_empty());
