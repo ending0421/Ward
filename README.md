@@ -26,9 +26,9 @@ catalog, metrics with graduation thresholds, competitive analysis — lives in
 | Spec phase | Scope | Status |
 | :--- | :--- | :--- |
 | Phase 0 | M1 Spot prototype on Rust (self-dogfood) | ✅ implemented |
-| Phase 1 | L2 simhash + block-level fingerprints + feedback loop + M2 deterministic layer | ✅ implemented (embeddings/L3 deferred) |
-| Phase 2 | M3 sandbox adjudication + M4 assertions + LLM narration | 🟡 deterministic parts implemented; LLM narration not included (structured fallback only, per F6) |
-| Phase 3 | Kotlin/Swift/Java/OC grammars compiled in, spec-driven extraction | ✅ five grammars + LanguageSpec taxonomy shipped; M5/M6 pending |
+| Phase 1 | L2 simhash + block-level fingerprints + feedback loop + M2 deterministic layer | ✅ implemented |
+| Phase 2 | M3 sandbox adjudication + M4 assertions + M2 narration (anchor-validated, F6 fallback) | ✅ implemented (LLM narration via `--narrate` + `WARD_LLM_URL`; L3 is a hashing embedder with a pluggable provider trait) |
+| Phase 3 | Five grammars + LanguageSpec, M5 context cards, M6 duplicate clustering | ✅ implemented |
 
 ## Quick start
 
@@ -104,6 +104,20 @@ cannot inject context from PreToolUse
 Pipeline: L1 equality → BM25 recall → L2 simhash ranking → thresholded
 grades. **Strong grades require fingerprint evidence**; text-only matches are
 capped at `weak` by construction.
+
+## More commands
+
+```bash
+# one-page context card: definition, callers (lower bound), tests, config refs (M5)
+./target/release/ward card simhash --repo .
+
+# offline duplicate clustering for the consolidation workflow (M6)
+./target/release/ward clusters --threshold 0.92 --repo .
+
+# LLM narration over Replay (M2): every sentence anchor-validated, F6 fallback
+WARD_LLM_URL=https://api.example.com/v1/chat/completions \
+  ./target/release/ward replay HEAD~3 HEAD --narrate --repo .
+```
 
 ## How Replay works (deterministic, anti-hallucination)
 
