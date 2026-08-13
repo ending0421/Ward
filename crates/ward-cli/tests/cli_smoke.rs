@@ -112,6 +112,81 @@ fn form_check_evaluates_spec() {
 }
 
 #[test]
+fn card_clusters_replay_and_intent_roundtrip() {
+    let repo = repo_with_rust();
+    let out = ward(&["index", "--repo", "."], repo.path());
+    assert!(out.status.success());
+
+    let out = ward(&["card", "--repo", ".", "debounce"], repo.path());
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("debounce (function_item)"),
+        "card: {stdout}"
+    );
+    assert!(stdout.contains("callers"), "card callers section");
+
+    let out = ward(&["clusters", "--repo", ".", "--json"], repo.path());
+    assert!(out.status.success());
+    let json: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).unwrap();
+    assert!(json["clusters"].is_array());
+    assert_eq!(json["truncated"], false);
+
+    // Replay needs two commits.
+    std::fs::write(
+        repo.path().join("src/lib.rs"),
+        "pub fn debounce() { let x = 1; let y = x + 1; let z = y + 1; }\n",
+    )
+    .unwrap();
+    let git = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo.path())
+        .args(["add", "-A"])
+        .output()
+        .unwrap();
+    assert!(git.status.success());
+    let git = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo.path())
+        .args(["commit", "-q", "-m", "c2"])
+        .output()
+        .unwrap();
+    assert!(git.status.success());
+    let out = ward(&["index", "--repo", "."], repo.path());
+    assert!(out.status.success());
+    let out = ward(&["replay", "HEAD^", "HEAD", "--repo", "."], repo.path());
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).contains("Replay"));
+
+    // intent-check without a provider: honest "not executed" JSON.
+    let out = ward(
+        &[
+            "intent-check",
+            "--repo",
+            ".",
+            "--requirement",
+            "实现防抖",
+            "--json",
+        ],
+        repo.path(),
+    );
+    assert!(out.status.success());
+    let json: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).unwrap();
+    assert_eq!(json["executed"], false);
+    assert_eq!(json["partition"], "llm_soft");
+}
+
+#[test]
 fn catch_run_reports_pass_for_true_command() {
     let repo = repo_with_rust();
     // Override the lint command to something deterministic.
