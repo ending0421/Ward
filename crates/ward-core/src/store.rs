@@ -399,13 +399,7 @@ impl Store {
 
     /// Record content hash + (mtime, size) — the incremental-indexing key.
     /// mtime/size equal ⇒ content unchanged (spec §5.2 three-level check).
-    pub fn set_file_meta(
-        &self,
-        file_path: &str,
-        hash: &str,
-        mtime: i64,
-        size: i64,
-    ) -> Result<()> {
+    pub fn set_file_meta(&self, file_path: &str, hash: &str, mtime: i64, size: i64) -> Result<()> {
         self.conn.execute(
             "INSERT INTO file_hashes (file_path, hash, mtime, size) VALUES (?1, ?2, ?3, ?4)
              ON CONFLICT(file_path) DO UPDATE SET hash = excluded.hash,
@@ -657,6 +651,39 @@ mod tests {
         let runs = store.contract_runs_for_spec("specs/task.md").unwrap();
         assert_eq!(runs.len(), 2);
         assert_eq!(runs[0].verdict, "pass", "must be ordered oldest first");
+    }
+
+    #[test]
+    fn corrupted_database_triggers_f1_rebuild() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("index.db");
+        {
+            let mut store = Store::open(&db).unwrap();
+            store.replace_file("f.rs", &[symbol("f", "x")]).unwrap();
+        }
+        // Drop WAL sidecars first: while they exist, SQLite recovers from
+        // them and the main file is not the data source.
+        let _ = std::fs::remove_file(dir.path().join("index.db-wal"));
+        let _ = std::fs::remove_file(dir.path().join("index.db-shm"));
+        // Corrupt a whole page beyond the header (page 1 is sacred; page 2+
+        // corruption opens but fails `PRAGMA quick_check`).
+        let mut bytes = std::fs::read(&db).unwrap();
+        assert!(
+            bytes.len() > 400,
+            "need corruptible bytes, len={}",
+            bytes.len()
+        );
+        // Corrupt everything from the halfway point onward — page 1 header
+        // stays intact so the file still opens, but quick_check must fail.
+        let half = bytes.len() / 2;
+        for b in bytes.iter_mut().skip(half) {
+            *b ^= 0xAA;
+        }
+        std::fs::write(&db, &bytes).unwrap();
+        // Heavy corruption must fail LOUDLY at open (callers fail open),
+        // never return a half-broken store. The rebuild path itself (F1) is
+        // covered by the schema-version-mismatch test in engine_e2e.
+        assert!(Store::open(&db).is_err(), "bad corruption must fail open");
     }
 
     #[test]
