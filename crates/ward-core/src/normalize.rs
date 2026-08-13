@@ -81,7 +81,7 @@ pub fn canonical_form(tree: &Tree) -> String {
 /// `body_changed`).
 pub fn canonical_form_of(node: &Node) -> String {
     let mut out = String::new();
-    write_node(&node, &mut out);
+    write_node(node, &mut out);
     out
 }
 

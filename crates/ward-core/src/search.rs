@@ -113,7 +113,7 @@ pub fn tokenize(s: &str) -> Vec<String> {
 /// BM25 over symbol names/kinds. Kept deliberately small: the index holds
 /// 10⁴–10⁵ symbols, an in-memory pass is milliseconds (spec §4).
 pub struct Bm25 {
-    docs: Vec<usize>,           // indices into `symbols`
+    docs: Vec<usize>, // indices into `symbols`
     doc_tokens: Vec<Vec<String>>,
     df: HashMap<String, usize>, // document frequency per token
     n: usize,
@@ -220,7 +220,7 @@ pub fn spot(
 
     // Layer 1: exact structural equality (L1) when the signature parses.
     let parsed = proposed_signature.and_then(fingerprint::parse_rust);
-    let query_struct = parsed.as_ref().map(|t| fingerprint::struct_hash(t));
+    let query_struct = parsed.as_ref().map(fingerprint::struct_hash);
     let query_sim = parsed.as_ref().and_then(fingerprint::signature_simhash);
 
     if let Some(qs) = &query_struct {

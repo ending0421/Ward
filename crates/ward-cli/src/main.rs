@@ -10,7 +10,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use ward_core::config::{self, WardConfig};
 use ward_core::store::Store;
-use ward_core::verify::{catch_run, verify_full, CatchVerdict};
+use ward_core::verify::{CatchVerdict, catch_run, verify_full};
 use ward_core::{diff, index, search, spec};
 
 #[derive(Parser)]
@@ -244,8 +244,8 @@ fn main() -> Result<()> {
             let store = open_store(&repo)?;
             let parsed = spec::parse_spec_file(&spec_path)
                 .with_context(|| format!("parsing {}", spec_path.display()))?;
-            let head = ward_core::git::head_sha(&repo)?
-                .unwrap_or_else(|| "uncommitted".to_string());
+            let head =
+                ward_core::git::head_sha(&repo)?.unwrap_or_else(|| "uncommitted".to_string());
             let base = base.unwrap_or_else(|| "HEAD^".to_string());
             let results = spec::evaluate(&repo, &parsed, &base, &head)?;
             for r in &results {
@@ -280,7 +280,11 @@ fn main() -> Result<()> {
             }
             let _ = cfg;
         }
-        Cmd::Action { advisory, action, repo } => {
+        Cmd::Action {
+            advisory,
+            action,
+            repo,
+        } => {
             let store = open_store(&repo)?;
             if !matches!(action.as_str(), "accepted" | "ignored" | "dismissed") {
                 anyhow::bail!("action must be one of accepted|ignored|dismissed");

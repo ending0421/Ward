@@ -44,7 +44,10 @@ pub fn struct_hash(tree: &Tree) -> String {
 /// Kinds only — identifiers are deliberately absent so renaming leaves the
 /// feature multiset unchanged.
 fn node_feature(node: &Node) -> u64 {
-    let parent = node.parent().map(|p| p.kind().to_string()).unwrap_or_default();
+    let parent = node
+        .parent()
+        .map(|p| p.kind().to_string())
+        .unwrap_or_default();
     let mut f = String::with_capacity(64);
     f.push_str(&parent);
     f.push('|');
@@ -251,7 +254,10 @@ mod tests {
     #[test]
     fn l2_simhash_high_for_copy_then_modify() {
         let s = similarity(FN_A, FN_A_MODIFIED).unwrap();
-        assert!(s > 0.75, "near-duplicate similarity should be high, got {s}");
+        assert!(
+            s > 0.75,
+            "near-duplicate similarity should be high, got {s}"
+        );
     }
 
     #[test]

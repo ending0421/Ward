@@ -6,7 +6,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, params};
 
 /// Current schema version. Bump on any schema change; mismatches trigger a
 /// full rebuild instead of a migration (rebuild is cheap and always safe).
@@ -163,8 +163,8 @@ impl Store {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("creating {}", parent.display()))?;
         }
-        let conn = Connection::open(path)
-            .with_context(|| format!("opening index {}", path.display()))?;
+        let conn =
+            Connection::open(path).with_context(|| format!("opening index {}", path.display()))?;
         create_schema(&conn)?;
         let version: Option<i64> = conn
             .query_row(
@@ -182,9 +182,7 @@ impl Store {
                 )?;
             }
             Some(v) if v != SCHEMA_VERSION => {
-                tracing::warn!(
-                    "index schema version {v} != {SCHEMA_VERSION}; rebuilding (F1)"
-                );
+                tracing::warn!("index schema version {v} != {SCHEMA_VERSION}; rebuilding (F1)");
                 Self::reset(&conn)?;
             }
             Some(_) => {}
@@ -230,7 +228,10 @@ impl Store {
     /// per-symbol mention edges).
     pub fn replace_file(&mut self, file_path: &str, symbols: &[Symbol]) -> Result<Vec<i64>> {
         let tx = self.conn.transaction()?;
-        tx.execute("DELETE FROM symbols WHERE file_path = ?1", params![file_path])?;
+        tx.execute(
+            "DELETE FROM symbols WHERE file_path = ?1",
+            params![file_path],
+        )?;
         let mut ids = Vec::with_capacity(symbols.len());
         for s in symbols {
             tx.execute(
@@ -261,7 +262,10 @@ impl Store {
     /// Record identifier mentions for one symbol (static edge lower bound).
     pub fn set_mentions(&mut self, symbol_id: i64, names: &[String]) -> Result<()> {
         let tx = self.conn.transaction()?;
-        tx.execute("DELETE FROM mentions WHERE symbol_id = ?1", params![symbol_id])?;
+        tx.execute(
+            "DELETE FROM mentions WHERE symbol_id = ?1",
+            params![symbol_id],
+        )?;
         for n in names {
             tx.execute(
                 "INSERT INTO mentions (symbol_id, name) VALUES (?1, ?2)",
@@ -396,7 +400,14 @@ impl Store {
         self.conn.execute(
             "INSERT INTO contract_runs (spec_path, commit_sha, ts, assertion, verdict, detail)
              VALUES (?1,?2,?3,?4,?5,?6)",
-            params![r.spec_path, r.commit_sha, r.ts, r.assertion, r.verdict, r.detail],
+            params![
+                r.spec_path,
+                r.commit_sha,
+                r.ts,
+                r.assertion,
+                r.verdict,
+                r.detail
+            ],
         )?;
         Ok(())
     }
@@ -480,9 +491,7 @@ mod tests {
     fn struct_hash_lookup() {
         let dir = tempfile::tempdir().unwrap();
         let mut store = Store::open(&dir.path().join("index.db")).unwrap();
-        store
-            .replace_file("src/a.rs", &[symbol("a", "x")])
-            .unwrap();
+        store.replace_file("src/a.rs", &[symbol("a", "x")]).unwrap();
         let hits = store.symbols_by_struct_hash("s-a").unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].name, "a");

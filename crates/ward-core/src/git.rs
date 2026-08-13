@@ -19,7 +19,9 @@ fn git(repo: &Path, args: &[&str]) -> Result<std::process::Output> {
 pub fn head_sha(repo: &Path) -> Result<Option<String>> {
     let out = git(repo, &["rev-parse", "--verify", "HEAD"])?;
     if out.status.success() {
-        Ok(Some(String::from_utf8_lossy(&out.stdout).trim().to_string()))
+        Ok(Some(
+            String::from_utf8_lossy(&out.stdout).trim().to_string(),
+        ))
     } else {
         Ok(None)
     }
@@ -65,7 +67,11 @@ pub fn file_hash(path: &Path) -> Option<String> {
 
 /// Byte offset → 1-based line number within `source`.
 pub fn line_of(source: &str, byte: usize) -> usize {
-    source[..byte.min(source.len())].bytes().filter(|b| *b == b'\n').count() + 1
+    source[..byte.min(source.len())]
+        .bytes()
+        .filter(|b| *b == b'\n')
+        .count()
+        + 1
 }
 
 #[cfg(test)]

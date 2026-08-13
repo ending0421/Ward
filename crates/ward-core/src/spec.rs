@@ -92,18 +92,21 @@ pub fn parse_spec(markdown: &str, path: &str) -> Result<Spec> {
     };
     let yaml = extract_yaml_fence(markdown).unwrap_or_default();
     if yaml.is_empty() {
-        spec.issues.push("no yaml fence with assertions found".into());
+        spec.issues
+            .push("no yaml fence with assertions found".into());
         return Ok(spec);
     }
     let parsed: serde_yaml::Value =
         serde_yaml::from_str(&yaml).context("parsing spec yaml block")?;
     let Some(list) = parsed.get("assertions").and_then(|a| a.as_sequence()) else {
-        spec.issues.push("yaml block has no `assertions` sequence".into());
+        spec.issues
+            .push("yaml block has no `assertions` sequence".into());
         return Ok(spec);
     };
     for item in list {
         let Some(map) = item.as_mapping() else {
-            spec.issues.push(format!("assertion is not a map: {item:?}"));
+            spec.issues
+                .push(format!("assertion is not a map: {item:?}"));
             continue;
         };
         let get = |k: &str| -> Option<String> {
@@ -116,7 +119,8 @@ pub fn parse_spec(markdown: &str, path: &str) -> Result<Spec> {
                 })
         };
         let Some(kind) = get("kind") else {
-            spec.issues.push(format!("assertion without kind: {item:?}"));
+            spec.issues
+                .push(format!("assertion without kind: {item:?}"));
             continue;
         };
         spec.assertions.push(Assertion {
@@ -146,23 +150,14 @@ fn extract_yaml_fence(markdown: &str) -> Option<String> {
             buf.push('\n');
         }
     }
-    if buf.is_empty() {
-        None
-    } else {
-        Some(buf)
-    }
+    if buf.is_empty() { None } else { Some(buf) }
 }
 
 /// Evaluate all assertions of a spec against `base..head`.
 ///
 /// Inner-loop semantics (spec §3-M4): locally evaluable assertions get a
 /// real verdict; anything requiring the outer loop is `deferred`/`unknown`.
-pub fn evaluate(
-    repo: &Path,
-    spec: &Spec,
-    base: &str,
-    head: &str,
-) -> Result<Vec<AssertionResult>> {
+pub fn evaluate(repo: &Path, spec: &Spec, base: &str, head: &str) -> Result<Vec<AssertionResult>> {
     let changed = git::diff_names(repo, base, head).unwrap_or_default();
     let mut results = Vec::new();
     for a in &spec.assertions {
@@ -176,7 +171,11 @@ fn evaluate_one(changed: &[String], a: &Assertion) -> AssertionResult {
         "no_new_dependency" => {
             let hits: Vec<&String> = changed
                 .iter()
-                .filter(|p| DEP_MANIFESTS.iter().any(|m| p == m || p.ends_with(&format!("/{m}"))))
+                .filter(|p| {
+                    DEP_MANIFESTS
+                        .iter()
+                        .any(|m| p == m || p.ends_with(&format!("/{m}")))
+                })
                 .collect();
             if hits.is_empty() {
                 AssertionResult {
@@ -188,7 +187,13 @@ fn evaluate_one(changed: &[String], a: &Assertion) -> AssertionResult {
                 AssertionResult {
                     assertion: a.kind.clone(),
                     verdict: Verdict::Fail,
-                    detail: format!("依赖清单变更：{}", hits.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")),
+                    detail: format!(
+                        "依赖清单变更：{}",
+                        hits.iter()
+                            .map(|s| s.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
                 }
             }
         }

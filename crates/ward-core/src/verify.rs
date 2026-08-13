@@ -50,11 +50,7 @@ pub struct CatchReport {
 /// Run a command with a timeout; returns (exit_ok, stdout, stderr).
 fn run_with_timeout(cmd: &mut Command, timeout: Duration) -> (bool, String, String) {
     let start = Instant::now();
-    let Ok(mut child) = cmd
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-    else {
+    let Ok(mut child) = cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn() else {
         return (false, String::new(), "failed to spawn".into());
     };
     let deadline = start + timeout;
@@ -92,7 +88,14 @@ fn read_all(child: std::process::Child) -> (String, String) {
 }
 
 fn tail(s: &str, lines: usize) -> String {
-    s.lines().rev().take(lines).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("\n")
+    s.lines()
+        .rev()
+        .take(lines)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Inner-loop precheck: run the configured lint command (no Docker).
@@ -117,10 +120,8 @@ pub fn catch_run(repo: &Path, config: &WardConfig) -> CatchReport {
     };
     let mut cmd = Command::new(prog);
     cmd.args(parts).current_dir(repo);
-    let (ok, stdout, stderr) = run_with_timeout(
-        &mut cmd,
-        Duration::from_secs(config.lint.timeout_secs),
-    );
+    let (ok, stdout, stderr) =
+        run_with_timeout(&mut cmd, Duration::from_secs(config.lint.timeout_secs));
     let output_tail = tail(&format!("{stdout}\n{stderr}"), 12);
     let duration_ms = start.elapsed().as_millis() as u64;
     if stderr.contains("timeout") && !ok {
@@ -187,7 +188,7 @@ pub fn verify_full(repo: &Path, config: &WardConfig) -> CatchReport {
                 note: "无法解析仓库路径".into(),
                 output_tail: String::new(),
                 duration_ms: start.elapsed().as_millis() as u64,
-            }
+            };
         }
     };
     let repo_str = repo_abs.to_string_lossy().into_owned();

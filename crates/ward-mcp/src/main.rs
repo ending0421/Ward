@@ -8,7 +8,7 @@
 use std::path::PathBuf;
 
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::{schemars, tool, tool_router, ServiceExt, transport::stdio};
+use rmcp::{ServiceExt, schemars, tool, tool_router, transport::stdio};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use ward_core::config::{self, WardConfig};
@@ -110,7 +110,9 @@ struct WardMcp;
 impl WardMcp {
     /// Pre-generation duplicate check: find existing similar implementations
     /// before writing new code. Fail-open advisory; never blocks.
-    #[tool(description = "Pre-generation duplicate check (M1 Spot). Pass an intent and, ideally, a proposed signature; returns structurally similar existing symbols with path:line anchors.")]
+    #[tool(
+        description = "Pre-generation duplicate check (M1 Spot). Pass an intent and, ideally, a proposed signature; returns structurally similar existing symbols with path:line anchors."
+    )]
     fn spot(&self, Parameters(p): Parameters<SpotParams>) -> String {
         let repo = resolve_repo(p.repo);
         let cfg = load_config(&repo);
@@ -120,7 +122,13 @@ impl WardMcp {
         }
         let result = (|| -> anyhow::Result<_> {
             let store = Store::open(&Store::default_path(&repo))?;
-            ward_core::search::spot(&repo, &store, &cfg, &p.intent, p.proposed_signature.as_deref())
+            ward_core::search::spot(
+                &repo,
+                &store,
+                &cfg,
+                &p.intent,
+                p.proposed_signature.as_deref(),
+            )
         })();
         match result {
             Ok(r) => ToolEnvelope::ok(r),
@@ -131,7 +139,9 @@ impl WardMcp {
     /// Deterministic symbol-level change summary between two commits.
     /// Structured facts only; the LLM narration layer is not part of this
     /// tool.
-    #[tool(description = "Deterministic semantic change summary (M2 Replay) between two commits, with path:line anchors, lower-bound impact and risk markers.")]
+    #[tool(
+        description = "Deterministic semantic change summary (M2 Replay) between two commits, with path:line anchors, lower-bound impact and risk markers."
+    )]
     fn replay(&self, Parameters(p): Parameters<ReplayParams>) -> String {
         let repo = resolve_repo(p.repo);
         let cfg = load_config(&repo);
@@ -147,7 +157,9 @@ impl WardMcp {
 
     /// Inner-loop lint/type precheck. No Docker; full test suites are
     /// deferred to the CI outer loop.
-    #[tool(description = "Inner-loop lint/type precheck (M3 Catch, no Docker). Verdict pass/fail/deferred/unknown; full test suites are deferred to CI.")]
+    #[tool(
+        description = "Inner-loop lint/type precheck (M3 Catch, no Docker). Verdict pass/fail/deferred/unknown; full test suites are deferred to CI."
+    )]
     fn catch_run(&self, Parameters(p): Parameters<CatchRunParams>) -> String {
         let repo = resolve_repo(p.repo);
         let cfg = load_config(&repo);
@@ -161,7 +173,9 @@ impl WardMcp {
 
     /// Outer-loop sandbox adjudication — only meaningful on machines with
     /// Docker; otherwise verdict is `unknown` (F13), never a fake pass.
-    #[tool(description = "Outer-loop sandbox adjudication (M3, Docker required). Without a sandbox the verdict is 'unknown' — never a fake green.")]
+    #[tool(
+        description = "Outer-loop sandbox adjudication (M3, Docker required). Without a sandbox the verdict is 'unknown' — never a fake green."
+    )]
     fn verify_full(&self, Parameters(p): Parameters<CatchRunParams>) -> String {
         let repo = resolve_repo(p.repo);
         let cfg = load_config(&repo);
@@ -170,7 +184,9 @@ impl WardMcp {
 
     /// Evaluate a task spec's assertions against base..head (inner-loop
     /// semantics: deferred/unknown for CI-only assertions).
-    #[tool(description = "Evaluate a task spec's machine-checkable assertions (M4 Form Check, inner-loop semantics). CI-only assertions are deferred, never faked.")]
+    #[tool(
+        description = "Evaluate a task spec's machine-checkable assertions (M4 Form Check, inner-loop semantics). CI-only assertions are deferred, never faked."
+    )]
     fn form_check(&self, Parameters(p): Parameters<FormCheckParams>) -> String {
         let repo = resolve_repo(p.repo);
         let result = (|| -> anyhow::Result<_> {
@@ -205,7 +221,9 @@ impl WardMcp {
 
     /// Record the agent's self-reported action for an advisory (M1 feedback
     /// loop: accepted/ignored/dismissed).
-    #[tool(description = "Record the agent's self-reported action for an advisory (M1 feedback loop): accepted | ignored | dismissed.")]
+    #[tool(
+        description = "Record the agent's self-reported action for an advisory (M1 feedback loop): accepted | ignored | dismissed."
+    )]
     fn spot_action(&self, Parameters(p): Parameters<SpotActionParams>) -> String {
         let repo = resolve_repo(p.repo);
         let result = (|| -> anyhow::Result<()> {

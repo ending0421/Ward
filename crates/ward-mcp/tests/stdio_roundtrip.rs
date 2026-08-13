@@ -2,7 +2,7 @@
 //! MCP Rust SDK client and exercise the real tools.
 
 use rmcp::model::{CallToolRequestParams, CallToolResult, ContentBlock};
-use rmcp::{transport::TokioChildProcess, ServiceExt};
+use rmcp::{ServiceExt, transport::TokioChildProcess};
 use tokio::process::Command;
 
 fn result_text(res: CallToolResult) -> String {
@@ -34,13 +34,20 @@ async fn lists_and_calls_tools_over_stdio() -> anyhow::Result<()> {
     // catch_run works without any index — pure inner-loop precheck.
     let res = client
         .call_tool(
-            CallToolRequestParams::new("catch_run")
-                .with_arguments(serde_json::json!({"repo": ".."}).as_object().cloned().unwrap()),
+            CallToolRequestParams::new("catch_run").with_arguments(
+                serde_json::json!({"repo": ".."})
+                    .as_object()
+                    .cloned()
+                    .unwrap(),
+            ),
         )
         .await?;
     let text = result_text(res);
     assert!(
-        text.contains("pass") || text.contains("fail") || text.contains("unknown") || text.contains("deferred"),
+        text.contains("pass")
+            || text.contains("fail")
+            || text.contains("unknown")
+            || text.contains("deferred"),
         "unexpected catch_run payload: {text}"
     );
 
@@ -60,7 +67,10 @@ async fn lists_and_calls_tools_over_stdio() -> anyhow::Result<()> {
         )
         .await?;
     let text = result_text(res);
-    assert!(text.contains("\"ok\""), "spot must return the tool envelope: {text}");
+    assert!(
+        text.contains("\"ok\""),
+        "spot must return the tool envelope: {text}"
+    );
 
     Ok(())
 }

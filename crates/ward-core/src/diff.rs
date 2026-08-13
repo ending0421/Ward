@@ -301,9 +301,10 @@ pub fn replay(
         .enumerate()
         .filter(|(_, c)| c.change == ChangeKind::Removed)
     {
-        if let Some(j) = changes.iter().position(|a| {
-            a.change == ChangeKind::Added && a.name == c.name && a.path != c.path
-        }) {
+        if let Some(j) = changes
+            .iter()
+            .position(|a| a.change == ChangeKind::Added && a.name == c.name && a.path != c.path)
+        {
             move_pairs.push((i, j));
         }
     }
