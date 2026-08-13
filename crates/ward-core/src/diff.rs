@@ -20,6 +20,7 @@ use tree_sitter::Node;
 use crate::config::WardConfig;
 use crate::fingerprint;
 use crate::git;
+use crate::lang::{Language, LanguageSpec};
 use crate::store::Store;
 
 /// Classification of one symbol's change between base and head.
@@ -75,42 +76,36 @@ struct DiffSymbol {
     name: String,
     kind_of: String,
     body_hash: String,
-    struct_hash: String,
     sig_hash: Option<String>,
     public: bool,
     start_byte: i64,
     end_byte: i64,
 }
 
-fn is_symbol_kind(kind: &str) -> bool {
-    matches!(
-        kind,
-        "function_item"
-            | "struct_item"
-            | "enum_item"
-            | "trait_item"
-            | "type_item"
-            | "const_item"
-            | "static_item"
-            | "macro_definition"
-    )
-}
-
-fn is_public(node: &Node) -> bool {
-    // `visibility_modifier` is a named child of the declaration, not a
-    // field (verified against tree-sitter-rust 0.23).
-    let mut cursor = node.walk();
-    node.named_children(&mut cursor)
-        .any(|c| c.kind() == "visibility_modifier")
+/// Public-visibility heuristic, cross-language lower bound:
+/// * Rust: a `visibility_modifier` named child;
+/// * Java/Swift/Kotlin: declaration text starts with `pub`/`public`.
+///
+/// Kotlin's *implicit* public visibility is not detected — reported impact
+/// is a lower bound, consistent with spec §3-M2.
+fn is_public(node: &Node, source: &str) -> bool {
+    let has_visibility_child = {
+        let mut cursor = node.walk();
+        node.named_children(&mut cursor)
+            .any(|c| c.kind().contains("visibility"))
+    };
+    let text = node.utf8_text(source.as_bytes()).unwrap_or("");
+    let trimmed = text.trim_start();
+    has_visibility_child || trimmed.starts_with("pub")
 }
 
 /// The signature form of a symbol: the whole declaration minus its body
 /// (functions/methods) or the whole declaration (structs/enums/traits).
-fn signature_hash(node: &Node) -> Option<String> {
+fn signature_hash(node: &Node, spec: &LanguageSpec) -> Option<String> {
     let body = node.child_by_field_name("body");
     let form = match body {
-        Some(b) => crate::normalize::canonical_form_excluding(node, b),
-        None => crate::normalize::canonical_form_of(node),
+        Some(b) => crate::normalize::canonical_form_excluding(node, b, spec),
+        None => crate::normalize::canonical_form_of(node, spec),
     };
     let mut h = blake3::Hasher::new();
     h.update(form.as_bytes());
@@ -118,52 +113,112 @@ fn signature_hash(node: &Node) -> Option<String> {
 }
 
 /// Extract the symbol surface of one source file.
-fn surface(source: &str) -> BTreeMap<(String, String), DiffSymbol> {
+fn surface(source: &str, spec: &LanguageSpec) -> BTreeMap<(String, String), DiffSymbol> {
     let mut out = BTreeMap::new();
-    let Some(tree) = fingerprint::parse_rust(source) else {
+    let mut parser = tree_sitter::Parser::new();
+    if parser
+        .set_language(&spec.lang.ts_language().unwrap())
+        .is_err()
+    {
+        return out;
+    }
+    let Some(tree) = parser.parse(source, None) else {
         return out;
     };
     let mut cursor = tree.walk();
     for node in tree.root_node().named_children(&mut cursor) {
-        collect_surface(&node, source, &mut out);
+        collect_surface(&node, source, spec, &mut out);
     }
     out
 }
 
-fn collect_surface(node: &Node, source: &str, out: &mut BTreeMap<(String, String), DiffSymbol>) {
-    if is_symbol_kind(node.kind()) {
-        if let Some(name_node) = node.child_by_field_name("name") {
+fn collect_surface(
+    node: &Node,
+    source: &str,
+    spec: &LanguageSpec,
+    out: &mut BTreeMap<(String, String), DiffSymbol>,
+) {
+    if spec.is_symbol_kind(node.kind()) {
+        let name_node = node.child_by_field_name(spec.name_field).or_else(|| {
+            let mut cursor = node.walk();
+            node.named_children(&mut cursor)
+                .find(|c| spec.is_identifier_kind(c.kind()))
+        });
+        if let Some(name_node) = name_node {
             if let Ok(name) = name_node.utf8_text(source.as_bytes()) {
                 let body = node.utf8_text(source.as_bytes()).unwrap_or("");
-                let struct_form = crate::normalize::canonical_form_of(node);
-                let mut h = blake3::Hasher::new();
-                h.update(struct_form.as_bytes());
                 out.insert(
                     (name.to_string(), node.kind().to_string()),
                     DiffSymbol {
                         name: name.to_string(),
                         kind_of: node.kind().to_string(),
                         body_hash: fingerprint::body_hash(body),
-                        struct_hash: h.finalize().to_hex().to_string(),
-                        sig_hash: signature_hash(node),
-                        public: is_public(node),
+                        sig_hash: signature_hash(node, spec),
+                        public: is_public(node, source),
                         start_byte: node.start_byte() as i64,
                         end_byte: node.end_byte() as i64,
                     },
                 );
             }
         }
+        if !spec.is_container_kind(node.kind()) {
+            return;
+        }
+    }
+    if spec.is_container_kind(node.kind()) {
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            collect_surface(&child, source, spec, out);
+        }
+    }
+}
+
+/// Source text with every comment node removed (byte-range deletion).
+/// Doc comments are *siblings* of declarations in most grammars (verified
+/// for tree-sitter-rust), so symbol-level hashes cannot see doc edits; this
+/// file-level view is how Replay detects doc-only changes.
+fn collect_comment_ranges(node: &Node, spec: &LanguageSpec, ranges: &mut Vec<(usize, usize)>) {
+    if spec.is_comment_kind(node.kind()) {
+        ranges.push((node.start_byte(), node.end_byte()));
         return;
     }
-    match node.kind() {
-        "impl_item" | "mod_item" | "declaration_list" | "source_file" | "block" => {
-            let mut cursor = node.walk();
-            for child in node.named_children(&mut cursor) {
-                collect_surface(&child, source, out);
-            }
-        }
-        _ => {}
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        collect_comment_ranges(&child, spec, ranges);
     }
+}
+
+fn strip_comments(source: &str, spec: &LanguageSpec) -> String {
+    let mut parser = tree_sitter::Parser::new();
+    if parser
+        .set_language(&spec.lang.ts_language().unwrap())
+        .is_err()
+    {
+        return source.to_string();
+    }
+    let Some(tree) = parser.parse(source, None) else {
+        return source.to_string();
+    };
+    let mut ranges: Vec<(usize, usize)> = Vec::new();
+    {
+        let mut cursor = tree.walk();
+        for node in tree.root_node().named_children(&mut cursor) {
+            collect_comment_ranges(&node, spec, &mut ranges);
+        }
+    }
+    ranges.sort_unstable();
+    let bytes = source.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut pos = 0usize;
+    for (start, end) in ranges {
+        if start < pos {
+            continue; // nested/overlapping (should not happen)
+        }
+        out.extend_from_slice(&bytes[pos..start.min(bytes.len())]);
+        pos = end.min(bytes.len());
+    }
+    out.extend_from_slice(&bytes[pos..]);
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 fn lines_of(source: &str, start: i64, end: i64) -> String {
@@ -200,12 +255,20 @@ pub fn replay(
         }
         let old_src = git::show_file(repo, base, path)?;
         let new_src = git::show_file(repo, head, path)?;
+        // Files without a compiled grammar are skipped (fail-open).
+        let Some(lang) = Language::from_path(std::path::Path::new(path)) else {
+            continue;
+        };
+        if lang.ts_language().is_none() {
+            continue;
+        }
+        let spec = lang.spec();
 
         let (old_lines, new_lines) = match (&old_src, &new_src) {
             (Some(o), Some(n)) => (o.clone(), n.clone()),
             (None, Some(n)) => {
                 // Brand-new file: every symbol is Added.
-                for (_, s) in surface(n) {
+                for (_, s) in surface(n, spec) {
                     changes.push(SymbolChange {
                         path: path.clone(),
                         lines: lines_of(n, s.start_byte, s.end_byte),
@@ -220,7 +283,7 @@ pub fn replay(
             }
             (Some(o), None) => {
                 // Deleted file: every symbol is Removed.
-                for (_, s) in surface(o) {
+                for (_, s) in surface(o, spec) {
                     changes.push(SymbolChange {
                         path: path.clone(),
                         lines: "-".into(),
@@ -236,8 +299,26 @@ pub fn replay(
             (None, None) => continue,
         };
 
-        let old = surface(&old_lines);
-        let new = surface(&new_lines);
+        let old = surface(&old_lines, spec);
+        let new = surface(&new_lines, spec);
+
+        // Doc-only edit at file level: the versions differ only in comments
+        // (doc comments are siblings of declarations — symbol hashes are
+        // blind to them, spec §3-M2 doc_only detection).
+        if strip_comments(&old_lines, spec) == strip_comments(&new_lines, spec) {
+            for s in new.values() {
+                changes.push(SymbolChange {
+                    path: path.clone(),
+                    lines: lines_of(&new_lines, s.start_byte, s.end_byte),
+                    name: s.name.clone(),
+                    kind_of: s.kind_of.clone(),
+                    change: ChangeKind::DocOnly,
+                    moved_from: None,
+                    public: s.public,
+                });
+            }
+            continue;
+        }
 
         // Removed: in old, not in new.
         for (key, s) in &old {
@@ -272,9 +353,12 @@ pub fn replay(
                     if o.body_hash == s.body_hash {
                         continue; // unchanged
                     }
-                    let change = if o.struct_hash == s.struct_hash {
-                        ChangeKind::DocOnly
-                    } else if o.sig_hash == s.sig_hash {
+                    let change = if o.sig_hash == s.sig_hash {
+                        // Identical structure (modulo renames/literals, which
+                        // the canonical form collapses) but a different body:
+                        // the only possible edits are literal-only changes.
+                        // Doc-only edits never reach this path — they are
+                        // handled at file level above.
                         ChangeKind::BodyChanged
                     } else {
                         ChangeKind::SignatureChanged
@@ -465,11 +549,12 @@ fn change_label(kind: ChangeKind) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lang::RUST;
 
     #[test]
     fn surface_extracts_and_hashes_signatures() {
         let src = "pub fn debounce(f: Fn(u64), ms: u64) -> Fn(u64) { call(f, ms) }";
-        let s = surface(src);
+        let s = surface(src, &RUST);
         let (_, sym) = s.iter().next().unwrap();
         assert!(sym.public);
         assert!(sym.sig_hash.is_some());
@@ -477,9 +562,9 @@ mod tests {
 
     #[test]
     fn signature_hash_ignores_body_but_not_params() {
-        let a = surface("fn f(x: u64) -> u64 { x + 1 }");
-        let b = surface("fn f(x: u64) -> u64 { x * 999 }");
-        let c = surface("fn f(x: u64, y: u64) -> u64 { x + 1 }");
+        let a = surface("fn f(x: u64) -> u64 { x + 1 }", &RUST);
+        let b = surface("fn f(x: u64) -> u64 { x * 999 }", &RUST);
+        let c = surface("fn f(x: u64, y: u64) -> u64 { x + 1 }", &RUST);
         assert_eq!(
             a[&("f".to_string(), "function_item".to_string())].sig_hash,
             b[&("f".to_string(), "function_item".to_string())].sig_hash,
