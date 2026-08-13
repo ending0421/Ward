@@ -91,6 +91,30 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// API/ABI compatibility adjudication against a base rev (M4, outer
+    /// loop: cargo-semver-checks for Rust, unknown for other languages)
+    CompatCheck {
+        #[arg(long, default_value = "HEAD^")]
+        base: String,
+        #[arg(default_value = ".", long)]
+        repo: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Soft intent-drift comparison: original requirement vs change facts
+    /// (M4-b, LLM partition; requires WARD_LLM_URL, else "not executed")
+    IntentCheck {
+        #[arg(long)]
+        requirement: String,
+        #[arg(long, default_value = "HEAD^")]
+        base: String,
+        #[arg(long, default_value = "HEAD")]
+        head: String,
+        #[arg(default_value = ".", long)]
+        repo: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
     /// One-page context card for a symbol (M5: definition, callers, tests,
     /// config references)
     Card {
@@ -215,7 +239,7 @@ fn main() -> Result<()> {
             if json {
                 println!("{}", serde_json::to_string_pretty(&report)?);
             } else if narrate {
-                let provider = http_llm_from_env();
+                let provider = ward_core::llm::http_llm_from_env();
                 let out = ward_core::narrate::narrate(&report, provider.as_deref());
                 print!("{out}");
             } else {
@@ -320,6 +344,59 @@ fn main() -> Result<()> {
             }
             let _ = cfg;
         }
+        Cmd::CompatCheck { base, repo, json } => {
+            let report = ward_core::compat::api_compat_check(&repo, &base);
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!(
+                    "compat-check [{}] {} — {} ({:?})",
+                    report.tool,
+                    report.verdict.as_str(),
+                    report.detail,
+                    std::time::Duration::from_millis(report.duration_ms)
+                );
+            }
+            // Outer loop: unknown is never green (P7).
+            if report.verdict == ward_core::compat::CompatVerdict::Fail {
+                std::process::exit(1);
+            }
+            if report.verdict == ward_core::compat::CompatVerdict::Unknown {
+                std::process::exit(2);
+            }
+        }
+        Cmd::IntentCheck {
+            requirement,
+            base,
+            head,
+            repo,
+            json,
+        } => {
+            let cfg = load_config(&repo);
+            let store = open_store(&repo)?;
+            let provider = ward_core::llm::http_llm_from_env();
+            let hint = ward_core::intent::intent_drift_check(
+                &repo,
+                &store,
+                &cfg,
+                &requirement,
+                &base,
+                &head,
+                provider.as_deref(),
+            )?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&hint)?);
+            } else {
+                println!(
+                    "intent-check [{}] executed={}:",
+                    hint.partition, hint.executed
+                );
+                for h in &hint.hints {
+                    println!("  - {h}");
+                }
+                println!("note: {}", hint.note);
+            }
+        }
         Cmd::Card { query, repo, json } => {
             let cfg = load_config(&repo);
             let store = open_store(&repo)?;
@@ -390,41 +467,4 @@ fn main() -> Result<()> {
 
 fn short(sha: &str) -> String {
     sha.chars().take(8).collect()
-}
-
-/// OpenAI-compatible HTTP provider, configured purely from the environment:
-/// `WARD_LLM_URL` (required), optional `WARD_LLM_KEY` and `WARD_LLM_MODEL`.
-fn http_llm_from_env() -> Option<Box<dyn ward_core::narrate::LlmProvider>> {
-    let url = std::env::var("WARD_LLM_URL").ok()?;
-    Some(Box::new(HttpLlm {
-        url,
-        key: std::env::var("WARD_LLM_KEY").ok(),
-        model: std::env::var("WARD_LLM_MODEL").unwrap_or_else(|_| "default".into()),
-    }))
-}
-
-struct HttpLlm {
-    url: String,
-    key: Option<String>,
-    model: String,
-}
-
-impl ward_core::narrate::LlmProvider for HttpLlm {
-    fn complete(&self, prompt: &str) -> anyhow::Result<String> {
-        let body = serde_json::json!({
-            "model": self.model,
-            "max_tokens": 400,
-            "messages": [{ "role": "user", "content": prompt }],
-        });
-        let mut req = ureq::post(&self.url).header("Content-Type", "application/json");
-        if let Some(key) = &self.key {
-            req = req.header("Authorization", &format!("Bearer {key}"));
-        }
-        let mut resp = req.send_json(&body)?;
-        let parsed: serde_json::Value = resp.body_mut().read_json()?;
-        parsed["choices"][0]["message"]["content"]
-            .as_str()
-            .map(str::to_string)
-            .ok_or_else(|| anyhow::anyhow!("unexpected LLM response shape"))
-    }
 }
