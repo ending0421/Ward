@@ -10,17 +10,24 @@
 //! A hash only expresses *equality*; near-duplicates are the job of the
 //! L2 simhash, where similarity ≈ Jaccard of subtree-feature multisets via
 //! Hamming distance.
+//!
+//! Parsing and canonicalization are language-driven via [`LanguageSpec`].
 
 use blake3::Hasher;
 use tree_sitter::{Node, Tree};
 
-/// Parse Rust source with the tree-sitter-rust grammar.
-pub fn parse_rust(source: &str) -> Option<Tree> {
+use crate::lang::{Language, LanguageSpec};
+
+/// Parse source with the grammar for `lang`.
+pub fn parse(lang: Language, source: &str) -> Option<Tree> {
     let mut parser = tree_sitter::Parser::new();
-    parser
-        .set_language(&tree_sitter_rust::LANGUAGE.into())
-        .ok()?;
+    parser.set_language(&lang.ts_language()?).ok()?;
     parser.parse(source, None)
+}
+
+/// Parse Rust source (compat alias for the Rust-first call sites).
+pub fn parse_rust(source: &str) -> Option<Tree> {
+    parse(Language::Rust, source)
 }
 
 /// L0: CAS hash of the raw source text.
@@ -31,8 +38,16 @@ pub fn body_hash(source: &str) -> String {
 }
 
 /// L1: hash of the canonical structural form.
-pub fn struct_hash(tree: &Tree) -> String {
-    let form = crate::normalize::canonical_form(tree);
+pub fn struct_hash(tree: &Tree, spec: &LanguageSpec) -> String {
+    let form = crate::normalize::canonical_form(tree, spec);
+    let mut h = Hasher::new();
+    h.update(form.as_bytes());
+    h.finalize().to_hex().to_string()
+}
+
+/// L1 hash of a single symbol node (the form stored in the index).
+pub fn struct_hash_of(node: &Node, spec: &LanguageSpec) -> String {
+    let form = crate::normalize::canonical_form_of(node, spec);
     let mut h = Hasher::new();
     h.update(form.as_bytes());
     h.finalize().to_hex().to_string()
@@ -97,6 +112,14 @@ pub fn subtree_features_excluding(node: &Node, excluded: Node) -> Vec<u64> {
     features
 }
 
+fn collect_features(node: &Node, out: &mut Vec<u64>) {
+    out.push(node_feature(node));
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        collect_features(&child, out);
+    }
+}
+
 fn collect_features_excluding(node: &Node, excluded: Node, out: &mut Vec<u64>) {
     if node.id() == excluded.id() {
         return;
@@ -108,16 +131,13 @@ fn collect_features_excluding(node: &Node, excluded: Node, out: &mut Vec<u64>) {
     }
 }
 
-fn collect_features(node: &Node, out: &mut Vec<u64>) {
-    out.push(node_feature(node));
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        collect_features(&child, out);
-    }
-}
-
 /// L2: Charikar simhash over the feature multiset (multiplicity-weighted).
 pub fn simhash(features: &[u64]) -> u64 {
+    if features.is_empty() {
+        // An empty feature multiset carries no evidence; the all-zeros
+        // simhash is the honest encoding (never all-ones).
+        return 0;
+    }
     let mut v = [0i64; 64];
     for &f in features {
         for (i, slot) in v.iter_mut().enumerate() {
@@ -142,22 +162,21 @@ pub fn simhash(features: &[u64]) -> u64 {
 ///
 /// Two normalization steps make signature-shaped queries comparable to
 /// indexed symbols:
-/// * tolerant parses of signature-only snippets produce a
-///   `function_signature_item` (with `has_error`) — aliased to
-///   `function_item`;
-/// * the root's parent kind is pinned to `source_file`, matching the parent
-///   of indexed top-level symbols.
-pub fn signature_simhash(tree: &Tree) -> Option<u64> {
+/// * tolerant parses of signature-only snippets produce an aliased kind
+///   (e.g. Rust's `function_signature_item`) — mapped via the spec's
+///   `query_alias`;
+/// * the root's parent kind is pinned to the language's root kind, matching
+///   the parent of indexed top-level symbols.
+pub fn signature_simhash(tree: &Tree, spec: &LanguageSpec) -> Option<u64> {
     let root = tree.root_node();
     let mut cursor = root.walk();
     let node = root.named_children(&mut cursor).next()?;
-    let alias = match node.kind() {
-        "function_signature_item" => Some("function_item"),
-        _ => None,
-    };
+    let alias = spec
+        .query_alias
+        .and_then(|(from, to)| (node.kind() == from).then_some(to));
     let body = node.child_by_field_name("body");
     let mut features = Vec::new();
-    collect_features_alias(&node, Some("source_file"), alias, body, &mut features);
+    collect_features_alias(&node, Some(root.kind()), alias, body, &mut features);
     Some(simhash(&features))
 }
 
@@ -206,7 +225,7 @@ pub fn simhash_similarity(a: u64, b: u64) -> f64 {
     1.0 - (simhash_distance(a, b) as f64 / 64.0)
 }
 
-/// Similarity between two source snippets, computed end-to-end.
+/// Similarity between two Rust source snippets, computed end-to-end.
 pub fn similarity(source_a: &str, source_b: &str) -> Option<f64> {
     let tree_a = parse_rust(source_a)?;
     let tree_b = parse_rust(source_b)?;
@@ -218,6 +237,7 @@ pub fn similarity(source_a: &str, source_b: &str) -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lang::RUST;
 
     const FN_A: &str = "fn debounce(f: Fn(u64), ms: u64) -> Fn(u64) { call(f, ms) }";
     const FN_A_RENAMED: &str = "fn throttle(g: Fn(u32), secs: u32) -> Fn(u32) { call(g, secs) }";
@@ -235,14 +255,14 @@ mod tests {
     fn l1_struct_hash_ignores_rename() {
         let a = parse_rust(FN_A).unwrap();
         let b = parse_rust(FN_A_RENAMED).unwrap();
-        assert_eq!(struct_hash(&a), struct_hash(&b));
+        assert_eq!(struct_hash(&a, &RUST), struct_hash(&b, &RUST));
     }
 
     #[test]
     fn l1_struct_hash_differs_on_structure() {
         let a = parse_rust(FN_A).unwrap();
         let b = parse_rust(FN_B).unwrap();
-        assert_ne!(struct_hash(&a), struct_hash(&b));
+        assert_ne!(struct_hash(&a, &RUST), struct_hash(&b, &RUST));
     }
 
     #[test]
@@ -275,6 +295,13 @@ mod tests {
     }
 
     #[test]
+    fn simhash_empty_input_is_zero() {
+        assert_eq!(simhash(&[]), 0);
+        assert_eq!(simhash_distance(0, 0), 0);
+        assert_eq!(simhash_similarity(0, 0), 1.0);
+    }
+
+    #[test]
     fn signature_query_matches_symbol_signature() {
         // A signature-only query snippet (which tolerant parsing turns into
         // a `function_signature_item`) must align with the signature simhash
@@ -286,11 +313,35 @@ mod tests {
         let sym_node = t_full.root_node().named_child(0).unwrap();
         let body = sym_node.child_by_field_name("body").unwrap();
         let sym_sig = simhash(&subtree_features_excluding(&sym_node, body));
-        let q_sim = signature_simhash(&t_sig).unwrap();
+        let q_sim = signature_simhash(&t_sig, &RUST).unwrap();
         assert!(
             simhash_similarity(sym_sig, q_sim) > 0.9,
             "signature query must align with symbol signature (dist={})",
             simhash_distance(sym_sig, q_sim)
         );
+    }
+
+    #[test]
+    fn signature_simhash_none_for_empty_tree() {
+        let t = parse_rust("").unwrap();
+        assert!(signature_simhash(&t, &RUST).is_none());
+    }
+
+    #[test]
+    fn cross_language_parse_works() {
+        for lang in Language::ALL {
+            let src = match lang {
+                Language::Rust => "fn f() {}",
+                Language::Java => "class A { void f() {} }",
+                Language::Kotlin => "fun f() {}",
+                Language::Swift => "func f() {}",
+                Language::ObjC => "@interface A\n@end",
+            };
+            assert!(
+                parse(lang, src).is_some(),
+                "{} must parse a minimal snippet",
+                lang.as_str()
+            );
+        }
     }
 }
