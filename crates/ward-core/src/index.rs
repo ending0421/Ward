@@ -22,6 +22,9 @@ use crate::store::{Block, Store, Symbol};
 #[derive(Debug, Default)]
 pub struct IndexReport {
     pub files_indexed: usize,
+    /// Files skipped because mtime+size matched the previous pass
+    /// (incremental indexing, spec §5.2).
+    pub files_unchanged: usize,
     pub symbols_indexed: usize,
     pub blocks_indexed: usize,
     /// Files skipped because their language grammar is not compiled in yet
@@ -244,6 +247,20 @@ impl Indexer<'_> {
                 report.files_skipped_language += 1;
                 continue;
             };
+            // Incremental skip: mtime+size unchanged ⇒ content unchanged.
+            if let Ok(meta) = std::fs::metadata(&path) {
+                let mtime = meta
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0);
+                let size = meta.len() as i64;
+                if self.store.get_file_meta(&rel)? == Some((mtime, size)) {
+                    report.files_unchanged += 1;
+                    continue;
+                }
+            }
             let source = match std::fs::read_to_string(&path) {
                 Ok(s) => s,
                 Err(_) => continue, // unreadable file: skip, fail-open
@@ -290,7 +307,18 @@ impl Indexer<'_> {
             self.store.replace_blocks(&rel, &blocks)?;
 
             if let Some(h) = crate::git::file_hash(&path) {
-                self.store.set_file_hash(&rel, &h)?;
+                if let Ok(meta) = std::fs::metadata(&path) {
+                    let mtime = meta
+                        .modified()
+                        .ok()
+                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map(|d| d.as_secs() as i64)
+                        .unwrap_or(0);
+                    let size = meta.len() as i64;
+                    self.store.set_file_meta(&rel, &h, mtime, size)?;
+                } else {
+                    self.store.set_file_hash(&rel, &h)?;
+                }
             }
             report.files_indexed += 1;
             report.symbols_indexed += symbols.len();

@@ -154,9 +154,10 @@ fn main() -> Result<()> {
             let cfg = load_config(&repo);
             let report = index::index_repo(&repo, &cfg)?;
             println!(
-                "indexed {} files / {} symbols ({} skipped-language, {} unparsable, {} suppressed) at {:?}",
+                "indexed {} files / {} symbols ({} unchanged, {} skipped-language, {} unparsable, {} suppressed) at {:?}",
                 report.files_indexed,
                 report.symbols_indexed,
+                report.files_unchanged,
                 report.files_skipped_language,
                 report.files_unparsable,
                 report.files_suppressed,
