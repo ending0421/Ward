@@ -259,6 +259,68 @@ fn spot_l1_structural_equality_when_signature_is_full_body() {
 }
 
 #[test]
+fn context_card_assembles_callers_tests_and_config_refs() {
+    let repo = TestRepo::new();
+    repo.write(
+        "src/lib.rs",
+        "pub fn debounce() {}\npub fn caller() { debounce(); }\n",
+    );
+    repo.write("tests/debounce_test.rs", "fn t() { debounce(); }\n");
+    repo.write("Cargo.toml", "[package]\nname = \"debounce-utils\"\n");
+    repo.commit_all("c1");
+    index::index_repo(repo.path(), &cfg()).unwrap();
+    let store = Store::open(&Store::default_path(repo.path())).unwrap();
+    let card = ward_core::context::context_card(repo.path(), &store, &cfg(), "debounce").unwrap();
+    assert_eq!(card.symbol, "debounce");
+    assert_eq!(card.language, "rust");
+    assert!(card.lines.contains('1'), "lines: {}", card.lines);
+    assert!(
+        card.callers.iter().any(|c| c.symbol == "caller"),
+        "callers: {:?}",
+        card.callers
+    );
+    assert!(
+        card.tests
+            .iter()
+            .any(|t| t.path == "tests/debounce_test.rs"),
+        "tests: {:?}",
+        card.tests
+    );
+    assert!(
+        card.config_refs
+            .iter()
+            .any(|r| r.path == "Cargo.toml" && r.line == 2),
+        "config refs: {:?}",
+        card.config_refs
+    );
+}
+
+#[test]
+fn replay_handles_java_changes() {
+    let repo = TestRepo::new();
+    repo.write(
+        "src/Main.java",
+        "public class Main { int bar() { return 1; } }\n",
+    );
+    let base = repo.commit_all("base");
+    repo.write(
+        "src/Main.java",
+        "public class Main { int bar() { return 2; } }\n",
+    );
+    let head = repo.commit_all("head");
+    index::index_repo(repo.path(), &cfg()).unwrap();
+    let store = Store::open(&Store::default_path(repo.path())).unwrap();
+    let report = replay(repo.path(), &store, &cfg(), &base, &head).unwrap();
+    assert!(
+        report.changes.iter().any(|c| c.name == "bar"),
+        "java symbols must be classified: {:?}",
+        report.changes
+    );
+    let md = ward_core::diff::render_markdown(&report);
+    assert!(md.contains("src/Main.java"));
+}
+
+#[test]
 fn replay_skips_non_code_files() {
     let repo = TestRepo::new();
     repo.write("README.md", "# title\n");
