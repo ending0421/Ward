@@ -160,6 +160,34 @@ docs/          # the design spec (v0.6.1)
 | P6 | Deterministic backstop | Tests/lint/type/contract assertions run deterministically in CI; LLMs narrate, never adjudicate |
 | P7 | Two loops, two postures | Inner loop fail-open, outer loop fail-closed: fail = red, `unknown` is never green |
 
+## Releasing
+
+The release pipeline (`.github/workflows/release.yml`) is **Release-Target
+driven**:
+
+1. **Trigger** — push a `v*` tag (canonical Release Target), or run the
+   workflow manually (`workflow_dispatch` derives the tag from the workspace
+   version in `Cargo.toml`).
+2. **Quality gate** — the same reusable checks that block merges
+   (fmt / clippy `-D warnings` / full test suite / coverage ≥85%) run before
+   any artifact is produced.
+3. **Version consistency** — on tag pushes, the tag must match the workspace
+   version; mismatches fail the pipeline.
+4. **Artifacts** — five targets: Linux x86_64 + aarch64 (cross), macOS
+   x86_64 + aarch64, Windows x86_64. Each package is a tar.gz/zip containing
+   `ward`, `ward-mcp`, LICENSE, README, hooks, examples and docs.
+5. **Release Notes** — auto-generated from conventional-commit history
+   (`scripts/gen-release-notes.sh`), grouped by Features / Fixes / Tests /
+   CI / Docs.
+6. **Publish** — `gh release create` with SHA256SUMS.txt, prerelease flag
+   for `-rc`/`-beta` tags, and asset re-upload (--clobber) when re-running.
+
+```bash
+# Cut a release:
+git tag v0.1.0 && git push origin v0.1.0
+# → quality gate → 5-target build → notes → GitHub Release
+```
+
 ## Development
 
 ```bash
