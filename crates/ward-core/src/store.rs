@@ -10,7 +10,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 /// Current schema version. Bump on any schema change; mismatches trigger a
 /// full rebuild instead of a migration (rebuild is cheap and always safe).
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 3;
 
 /// One indexed symbol (function / struct / enum / trait / method, …).
 #[derive(Debug, Clone, PartialEq)]
@@ -158,10 +158,13 @@ fn create_schema(conn: &Connection) -> Result<()> {
         );
         CREATE INDEX IF NOT EXISTS idx_contract_runs_spec ON contract_runs(spec_path);
 
-        -- per-file content hashes for the per-file freshness protocol (spec §5)
+        -- per-file content hashes for the per-file freshness protocol (spec §5),
+        -- plus mtime/size for the incremental-indexing skip (spec §5.2)
         CREATE TABLE IF NOT EXISTS file_hashes (
             file_path TEXT PRIMARY KEY,
-            hash      TEXT NOT NULL
+            hash      TEXT NOT NULL,
+            mtime     INTEGER NOT NULL DEFAULT 0,
+            size      INTEGER NOT NULL DEFAULT 0
         );
         "#,
     )
@@ -392,6 +395,36 @@ impl Store {
             params![file_path, hash],
         )?;
         Ok(())
+    }
+
+    /// Record content hash + (mtime, size) — the incremental-indexing key.
+    /// mtime/size equal ⇒ content unchanged (spec §5.2 three-level check).
+    pub fn set_file_meta(
+        &self,
+        file_path: &str,
+        hash: &str,
+        mtime: i64,
+        size: i64,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO file_hashes (file_path, hash, mtime, size) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(file_path) DO UPDATE SET hash = excluded.hash,
+                 mtime = excluded.mtime, size = excluded.size",
+            params![file_path, hash, mtime, size],
+        )?;
+        Ok(())
+    }
+
+    /// The stored (mtime, size) for a file, if indexed before.
+    pub fn get_file_meta(&self, file_path: &str) -> Result<Option<(i64, i64)>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT mtime, size FROM file_hashes WHERE file_path = ?1",
+                params![file_path],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?)
     }
 
     pub fn get_file_hash(&self, file_path: &str) -> Result<Option<String>> {
