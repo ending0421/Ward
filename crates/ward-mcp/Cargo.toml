@@ -7,4 +7,21 @@ license.workspace = true
 repository.workspace = true
 description.workspace = true
 
+[[bin]]
+name = "ward-mcp"
+path = "src/main.rs"
+
 [dependencies]
+ward-core.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+rmcp = { version = "3", features = ["server", "transport-io"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+schemars = "1"
+
+[dev-dependencies]
+rmcp = { version = "3", features = ["client", "transport-child-process"] }
+serde_json.workspace = true
