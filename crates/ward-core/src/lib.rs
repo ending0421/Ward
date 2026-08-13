@@ -12,4 +12,6 @@ pub mod index;
 pub mod lang;
 pub mod normalize;
 pub mod search;
+pub mod spec;
 pub mod store;
+pub mod verify;
