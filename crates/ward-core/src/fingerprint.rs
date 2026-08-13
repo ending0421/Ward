@@ -77,6 +77,14 @@ pub fn subtree_features(tree: &Tree) -> Vec<u64> {
     features
 }
 
+/// Collect the subtree-feature multiset of a single node (used for per-symbol
+/// simhashes during indexing).
+pub fn subtree_features_of(node: &Node) -> Vec<u64> {
+    let mut features = Vec::new();
+    collect_features(node, &mut features);
+    features
+}
+
 fn collect_features(node: &Node, out: &mut Vec<u64>) {
     out.push(node_feature(node));
     let mut cursor = node.walk();
