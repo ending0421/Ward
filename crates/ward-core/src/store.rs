@@ -31,6 +31,21 @@ pub struct Symbol {
     pub commit_sha: String,
 }
 
+/// A block-level fingerprint (spec §3-M1: sliding statement windows
+/// inside function bodies — catches the in-function duplication that
+/// symbol-level fingerprints cannot see).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Block {
+    pub id: Option<i64>,
+    pub file_path: String,
+    pub parent_symbol_id: Option<i64>,
+    pub start_byte: i64,
+    pub end_byte: i64,
+    pub simhash: u64,
+    pub kind: String,
+    pub commit_sha: String,
+}
+
 /// An advisory outcome record (M1 feedback loop, spec §4).
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Advisory {
@@ -309,6 +324,53 @@ impl Store {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
+    /// Replace every block fingerprint of one file.
+    pub fn replace_blocks(&mut self, file_path: &str, blocks: &[Block]) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "DELETE FROM blocks WHERE file_path = ?1",
+            params![file_path],
+        )?;
+        for b in blocks {
+            tx.execute(
+                "INSERT INTO blocks (file_path, parent_symbol_id, start_byte, end_byte, simhash, kind, commit_sha)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7)",
+                params![
+                    b.file_path,
+                    b.parent_symbol_id,
+                    b.start_byte,
+                    b.end_byte,
+                    b.simhash as i64,
+                    b.kind,
+                    b.commit_sha,
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// All block fingerprints (in-function statement windows).
+    pub fn all_blocks(&self) -> Result<Vec<Block>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, file_path, parent_symbol_id, start_byte, end_byte, simhash, kind, commit_sha FROM blocks",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            let simhash: i64 = r.get(5)?;
+            Ok(Block {
+                id: r.get(0)?,
+                file_path: r.get(1)?,
+                parent_symbol_id: r.get(2)?,
+                start_byte: r.get(3)?,
+                end_byte: r.get(4)?,
+                simhash: simhash as u64,
+                kind: r.get(6)?,
+                commit_sha: r.get(7)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
     // ---- freshness (spec §5) ---------------------------------------------
 
     pub fn set_file_hash(&self, file_path: &str, hash: &str) -> Result<()> {
@@ -550,6 +612,22 @@ mod tests {
         let runs = store.contract_runs_for_spec("specs/task.md").unwrap();
         assert_eq!(runs.len(), 2);
         assert_eq!(runs[0].verdict, "pass", "must be ordered oldest first");
+    }
+
+    #[test]
+    fn file_hash_overwrites() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("index.db")).unwrap();
+        store.set_file_hash("f.rs", "h1").unwrap();
+        store.set_file_hash("f.rs", "h2").unwrap();
+        assert_eq!(store.get_file_hash("f.rs").unwrap().unwrap(), "h2");
+    }
+
+    #[test]
+    fn contract_runs_empty_for_unknown_spec() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("index.db")).unwrap();
+        assert!(store.contract_runs_for_spec("nope").unwrap().is_empty());
     }
 
     #[test]
