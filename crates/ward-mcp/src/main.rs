@@ -50,6 +50,9 @@ pub struct ReplayParams {
     pub base: String,
     pub head: String,
     pub repo: Option<String>,
+    /// Add an anchor-validated LLM narration section (requires
+    /// WARD_LLM_URL; failures fall back to the structured list).
+    pub narrate: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
@@ -181,7 +184,16 @@ impl WardMcp {
         let cfg = load_config(&repo);
         let result = (|| -> anyhow::Result<_> {
             let store = Store::open(&Store::default_path(&repo))?;
-            ward_core::diff::replay(&repo, &store, &cfg, &p.base, &p.head)
+            let report = ward_core::diff::replay(&repo, &store, &cfg, &p.base, &p.head)?;
+            if p.narrate.unwrap_or(false) {
+                let provider = ward_core::llm::http_llm_from_env();
+                Ok(serde_json::json!({
+                    "report": report,
+                    "narrative": ward_core::narrate::narrate(&report, provider.as_deref()),
+                }))
+            } else {
+                Ok(serde_json::json!(report))
+            }
         })();
         match result {
             Ok(r) => ToolEnvelope::ok(r),
