@@ -4,6 +4,7 @@
 //! (design law P1). Nothing here owns truth and nothing here writes code.
 
 pub mod cluster;
+pub mod compat;
 pub mod config;
 pub mod context;
 pub mod diff;
@@ -12,7 +13,9 @@ pub mod fingerprint;
 pub mod fresh;
 pub mod git;
 pub mod index;
+pub mod intent;
 pub mod lang;
+pub mod llm;
 pub mod narrate;
 pub mod normalize;
 pub mod search;
