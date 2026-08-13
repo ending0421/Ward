@@ -155,6 +155,30 @@ pub fn catch_run(repo: &Path, config: &WardConfig) -> CatchReport {
     }
 }
 
+/// Map a sandbox run's raw outcome to a CatchReport (pure, testable).
+fn outer_report(
+    ok: bool,
+    config: &WardConfig,
+    output_tail: String,
+    duration_ms: u64,
+) -> CatchReport {
+    if ok {
+        CatchReport {
+            verdict: CatchVerdict::Pass,
+            note: format!("外环沙箱裁决通过：{}", config.sandbox.verify_command),
+            output_tail,
+            duration_ms,
+        }
+    } else {
+        CatchReport {
+            verdict: CatchVerdict::Fail,
+            note: format!("外环沙箱裁决失败：{}", config.sandbox.verify_command),
+            output_tail,
+            duration_ms,
+        }
+    }
+}
+
 fn docker_available() -> bool {
     Command::new("docker")
         .args(["info", "--format", "{{.ServerVersion}}"])
@@ -163,6 +187,38 @@ fn docker_available() -> bool {
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
+}
+
+/// Build the docker-run argument vector for the sandbox.
+///
+/// Sandbox posture (spec §7): network disabled, no Docker socket mount, repo
+/// mounted read-only, target/cargo homes on the container's tmpfs, memory
+/// and pid limits, all capabilities dropped.
+pub fn sandbox_args(config: &WardConfig, repo_abs: &str) -> Vec<String> {
+    vec![
+        "run".to_string(),
+        "--rm".to_string(),
+        "--network".to_string(),
+        "none".to_string(),
+        "--memory".to_string(),
+        config.sandbox.memory.clone(),
+        "--pids-limit".to_string(),
+        "256".to_string(),
+        "--cap-drop".to_string(),
+        "ALL".to_string(),
+        "-v".to_string(),
+        format!("{repo_abs}:/repo:ro"),
+        "-w".to_string(),
+        "/repo".to_string(),
+        "-e".to_string(),
+        "CARGO_TARGET_DIR=/tmp/ward-target".to_string(),
+        "-e".to_string(),
+        "CARGO_HOME=/tmp/ward-cargo".to_string(),
+        config.sandbox.image.clone(),
+        "sh".to_string(),
+        "-c".to_string(),
+        config.sandbox.verify_command.clone(),
+    ]
 }
 
 /// Outer-loop adjudication inside a Docker sandbox.
@@ -193,48 +249,11 @@ pub fn verify_full(repo: &Path, config: &WardConfig) -> CatchReport {
     };
     let repo_str = repo_abs.to_string_lossy().into_owned();
     let mut cmd = Command::new("docker");
-    cmd.args([
-        "run",
-        "--rm",
-        "--network",
-        "none",
-        "--memory",
-        &config.sandbox.memory,
-        "--pids-limit",
-        "256",
-        "--cap-drop",
-        "ALL",
-        "-v",
-        &format!("{repo_str}:/repo:ro"),
-        "-w",
-        "/repo",
-        "-e",
-        "CARGO_TARGET_DIR=/tmp/ward-target",
-        "-e",
-        "CARGO_HOME=/tmp/ward-cargo",
-        &config.sandbox.image,
-        "sh",
-        "-c",
-        &config.sandbox.verify_command,
-    ]);
+    cmd.args(sandbox_args(config, &repo_str));
     let (ok, stdout, stderr) = run_with_timeout(&mut cmd, Duration::from_secs(1800));
     let output_tail = tail(&format!("{stdout}\n{stderr}"), 24);
     let duration_ms = start.elapsed().as_millis() as u64;
-    if ok {
-        CatchReport {
-            verdict: CatchVerdict::Pass,
-            note: format!("外环沙箱裁决通过：{}", config.sandbox.verify_command),
-            output_tail,
-            duration_ms,
-        }
-    } else {
-        CatchReport {
-            verdict: CatchVerdict::Fail,
-            note: format!("外环沙箱裁决失败：{}", config.sandbox.verify_command),
-            output_tail,
-            duration_ms,
-        }
-    }
+    outer_report(ok, config, output_tail, duration_ms)
 }
 
 #[cfg(test)]
@@ -254,6 +273,36 @@ mod tests {
         // test pins the serialized verdict vocabulary.
         assert_eq!(CatchVerdict::Unknown.as_str(), "unknown");
         assert_ne!(CatchVerdict::Unknown, CatchVerdict::Pass);
+    }
+
+    #[test]
+    fn outer_report_maps_outcomes() {
+        let cfg = WardConfig::default();
+        let pass = outer_report(true, &cfg, "x".into(), 1);
+        assert_eq!(pass.verdict, CatchVerdict::Pass);
+        let fail = outer_report(false, &cfg, "x".into(), 1);
+        assert_eq!(fail.verdict, CatchVerdict::Fail);
+        assert!(fail.note.contains("cargo test"));
+    }
+
+    #[test]
+    fn sandbox_args_enforce_the_security_posture() {
+        let cfg = WardConfig::default();
+        let args = sandbox_args(&cfg, "/abs/repo");
+        let joined = args.join(" ");
+        assert!(
+            args.windows(2).any(|w| w == ["--network", "none"]),
+            "network off"
+        );
+        assert!(joined.contains("/abs/repo:/repo:ro"), "read-only mount");
+        assert!(!joined.contains("/var/run/docker.sock"), "no docker socket");
+        assert!(
+            args.windows(2).any(|w| w == ["--cap-drop", "ALL"]),
+            "caps dropped"
+        );
+        assert!(args.contains(&"--pids-limit".to_string()));
+        assert!(args.contains(&"rust:1-bookworm".to_string()));
+        assert_eq!(args.last().unwrap(), "cargo test --quiet");
     }
 
     #[test]
