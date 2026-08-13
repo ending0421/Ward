@@ -26,6 +26,10 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tree-sitter = "0.25"
 tree-sitter-rust = "0.23"
+tree-sitter-java = "0.23.5"
+tree-sitter-kotlin = { git = "https://github.com/fwcd/tree-sitter-kotlin", rev = "1852ea17b7f60fb3f9d84e0b1555d56b46b39fb1" }
+tree-sitter-swift = "0.7.3"
+tree-sitter-objc = "3.0.2"
 rusqlite = { version = "0.37", features = ["bundled"] }
 blake3 = "1"
 serde_yaml = "0.9"

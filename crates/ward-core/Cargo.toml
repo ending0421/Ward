@@ -17,6 +17,10 @@ serde_yaml.workspace = true
 tracing.workspace = true
 tree-sitter.workspace = true
 tree-sitter-rust.workspace = true
+tree-sitter-java.workspace = true
+tree-sitter-kotlin.workspace = true
+tree-sitter-swift.workspace = true
+tree-sitter-objc.workspace = true
 rusqlite.workspace = true
 blake3.workspace = true
 
