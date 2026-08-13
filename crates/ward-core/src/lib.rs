@@ -1,14 +1,7 @@
-pub fn add(left: u64, right: u64) -> u64 {
-    left + right
-}
+//! Ward core: the reusable engine behind Spot / Replay / Catch / Form Check.
+//!
+//! Everything in this crate is a *derived view* over `git + working tree`
+//! (design law P1). Nothing here owns truth and nothing here writes code.
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
-    }
-}
+pub mod config;
+pub mod lang;
