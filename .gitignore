@@ -1,0 +1,17 @@
+# Rust build output
+/target
+
+# Local cargo registry cache (kept inside workspace to respect sandbox)
+/.cargo
+
+# Ward's own throwaway index (dogfood: Ward indexes itself)
+/.ward/
+
+# OS noise
+.DS_Store
+
+# Local SQLite artifacts
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
