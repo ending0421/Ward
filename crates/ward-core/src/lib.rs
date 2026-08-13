@@ -5,6 +5,8 @@
 
 pub mod config;
 pub mod fingerprint;
+pub mod git;
+pub mod index;
 pub mod lang;
 pub mod normalize;
 pub mod store;
