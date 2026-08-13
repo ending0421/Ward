@@ -27,7 +27,7 @@ catalog, metrics with graduation thresholds, competitive analysis — lives in
 | :--- | :--- | :--- |
 | Phase 0 | M1 Spot prototype on Rust (self-dogfood) | ✅ implemented |
 | Phase 1 | L2 simhash + block-level fingerprints + feedback loop + M2 deterministic layer | ✅ implemented |
-| Phase 2 | M3 sandbox adjudication + M4 assertions + M2 narration (anchor-validated, F6 fallback) | ✅ implemented (LLM narration via `--narrate` + `WARD_LLM_URL`; L3 is a hashing embedder with a pluggable provider trait) |
+| Phase 2 | M3 sandbox adjudication + M4 assertions + M2 narration (anchor-validated, F6 fallback) + M4-b intent drift + api_compat orchestration | ✅ implemented (LLM via `WARD_LLM_URL`; L3 hashing embedder with pluggable provider trait; Rust api_compat via cargo-semver-checks) |
 | Phase 3 | Five grammars + LanguageSpec, M5 context cards, M6 duplicate clustering | ✅ implemented |
 
 ## Quick start
@@ -117,6 +117,12 @@ capped at `weak` by construction.
 # LLM narration over Replay (M2): every sentence anchor-validated, F6 fallback
 WARD_LLM_URL=https://api.example.com/v1/chat/completions \
   ./target/release/ward replay HEAD~3 HEAD --narrate --repo .
+
+# API/ABI compatibility adjudication (M4 outer loop; Rust = cargo-semver-checks)
+./target/release/ward compat-check --base HEAD^ --repo .
+
+# Soft intent-drift check (M4-b; LLM partition, "not executed" without WARD_LLM_URL)
+./target/release/ward intent-check --requirement "实现防抖函数" --repo .
 ```
 
 ## How Replay works (deterministic, anti-hallucination)

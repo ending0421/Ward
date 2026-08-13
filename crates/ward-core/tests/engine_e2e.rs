@@ -178,13 +178,16 @@ fn incremental_indexing_skips_unchanged_files() {
     assert_eq!(first.files_unchanged, 0);
 
     let second = index::index_repo(repo.path(), &cfg()).unwrap();
-    assert_eq!(second.files_indexed, 0, "nothing changed ⇒ nothing re-parsed");
+    assert_eq!(
+        second.files_indexed, 0,
+        "nothing changed ⇒ nothing re-parsed"
+    );
     assert_eq!(second.files_unchanged, 2);
 
     // Touch one file: only that file is re-parsed.
     let touched = repo.path().join("src/other.rs");
     let mut content = std::fs::read_to_string(&touched).unwrap();
-    content.push_str("\n");
+    content.push('\n');
     std::fs::write(&touched, content).unwrap();
     let third = index::index_repo(repo.path(), &cfg()).unwrap();
     assert_eq!(third.files_indexed, 1);
