@@ -209,6 +209,26 @@ git tag v0.1.0 && git push origin v0.1.0
 # → quality gate → 5-target build → notes → GitHub Release
 ```
 
+## Verifying Ward actually works
+
+`scripts/verify-meaningful.sh` is the fail-closed self-check (11 checks, runs
+in CI on every push): it plants known duplicate cases into a real git repo
+and asserts the engine recalls the exact clone (L1), the copy-then-modify
+(L2) and does **not** false-positive on unrelated code — then asserts the
+adversarial semantics: F3 skips broken files, uncommitted edits mark
+advisories `stale`, `verify --full` without a sandbox is `unknown` (never a
+fake green), `must_pass` defers to CI, `api_compat` is `unknown` without its
+tool, and `intent-check` without an LLM reports "not executed".
+
+```bash
+scripts/verify-meaningful.sh $(command -v ward)
+```
+
+That proves correctness (levels 1–2). *Meaningfulness* (level 3) is a
+workflow metric question and needs real usage data — see spec §9: baseline
+vs intervention duplication rate (jscpd), review-time A/B, first-pass CI
+rate, and constraint-decay measurements on dogfood repositories.
+
 ## Development
 
 ```bash
