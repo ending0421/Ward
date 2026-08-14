@@ -180,13 +180,21 @@ fn outer_report(
 }
 
 fn docker_available(docker_bin: &str) -> bool {
-    Command::new(docker_bin)
+    // The docker CLIENT exits 0 even when the daemon is unreachable, so the
+    // exit status alone is not evidence. The daemon is only available when
+    // `docker info` actually renders a ServerVersion.
+    let Ok(out) = Command::new(docker_bin)
         .args(["info", "--format", "{{.ServerVersion}}"])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+        .output()
+    else {
+        return false;
+    };
+    if !out.status.success() {
+        return false;
+    }
+    let version = String::from_utf8_lossy(&out.stdout);
+    let version = version.trim();
+    !version.is_empty() && version.chars().next().is_some_and(|c| c.is_ascii_digit())
 }
 
 /// Build the docker-run argument vector for the sandbox.
@@ -195,7 +203,23 @@ fn docker_available(docker_bin: &str) -> bool {
 /// mounted read-only, target/cargo homes on the container's tmpfs, memory
 /// and pid limits, all capabilities dropped.
 pub fn sandbox_args(config: &WardConfig, repo_abs: &str) -> Vec<String> {
-    vec![
+    sandbox_args_with_cache(config, repo_abs, None)
+}
+
+/// Build the docker-run argument vector for the sandbox.
+///
+/// Sandbox posture (spec §7): network disabled, no Docker socket mount, repo
+/// mounted read-only, target/cargo homes on the container's tmpfs, memory
+/// and pid limits, all capabilities dropped. When a local cargo registry
+/// cache exists it is mounted read-only and cargo is forced offline — the
+/// sandbox then actually works on a dev machine (spec §3-M3: real execution,
+/// not a green light).
+pub fn sandbox_args_with_cache(
+    config: &WardConfig,
+    repo_abs: &str,
+    cargo_cache: Option<&str>,
+) -> Vec<String> {
+    let mut args = vec![
         "run".to_string(),
         "--rm".to_string(),
         "--network".to_string(),
@@ -214,11 +238,20 @@ pub fn sandbox_args(config: &WardConfig, repo_abs: &str) -> Vec<String> {
         "CARGO_TARGET_DIR=/tmp/ward-target".to_string(),
         "-e".to_string(),
         "CARGO_HOME=/tmp/ward-cargo".to_string(),
+        "-e".to_string(),
+        "CARGO_NET_OFFLINE=true".to_string(),
+    ];
+    if let Some(cache) = cargo_cache {
+        args.push("-v".to_string());
+        args.push(format!("{cache}:/tmp/ward-cargo:ro"));
+    }
+    args.extend([
         config.sandbox.image.clone(),
         "sh".to_string(),
         "-c".to_string(),
         config.sandbox.verify_command.clone(),
-    ]
+    ]);
+    args
 }
 
 /// Outer-loop adjudication inside a Docker sandbox.
@@ -254,11 +287,30 @@ pub fn run_sandbox(docker_bin: &str, repo: &Path, config: &WardConfig) -> CatchR
         }
     };
     let repo_str = repo_abs.to_string_lossy().into_owned();
+    // Repo-local cargo cache (e.g. the workspace .cargo kept by CI/dev
+    // builds) seeds the offline sandbox so the real test run can build.
+    let cache = repo_abs
+        .join(".cargo")
+        .is_dir()
+        .then(|| repo_abs.join(".cargo").to_string_lossy().into_owned());
     let mut cmd = Command::new(docker_bin);
-    cmd.args(sandbox_args(config, &repo_str));
+    cmd.args(sandbox_args_with_cache(config, &repo_str, cache.as_deref()));
     let (ok, stdout, stderr) = run_with_timeout(&mut cmd, Duration::from_secs(1800));
-    let output_tail = tail(&format!("{stdout}\n{stderr}"), 24);
+    let combined = format!("{stdout}\n{stderr}");
+    let output_tail = tail(&combined, 24);
     let duration_ms = start.elapsed().as_millis() as u64;
+    // A docker client without a reachable daemon is a *missing sandbox*
+    // (F13 → unknown), never a failed test run.
+    if combined.contains("Cannot connect to the Docker daemon")
+        || combined.contains("Is the docker daemon running")
+    {
+        return CatchReport {
+            verdict: CatchVerdict::Unknown,
+            note: "沙箱不可用（docker 守护进程未运行）；仅 CI 可裁决（F13）".into(),
+            output_tail,
+            duration_ms,
+        };
+    }
     outer_report(ok, config, output_tail, duration_ms)
 }
 
@@ -351,6 +403,61 @@ mod tests {
         }
         let r2 = run_sandbox(fail_bin.to_str().unwrap(), repo.path(), &cfg);
         assert_eq!(r2.verdict, CatchVerdict::Fail);
+    }
+
+    #[test]
+    fn sandbox_cache_mount_is_conditional() {
+        let cfg = WardConfig::default();
+        // No cache: no mount, but offline is always forced.
+        let args = sandbox_args_with_cache(&cfg, "/repo", None);
+        assert!(!args.iter().any(|a| a.contains("/tmp/ward-cargo:ro")));
+        assert!(args.windows(2).any(|w| w == ["-e", "CARGO_NET_OFFLINE=true"]));
+        // With cache: read-only mount appears.
+        let args = sandbox_args_with_cache(&cfg, "/repo", Some("/home/u/.cargo"));
+        assert!(args.contains(&"-v".to_string()));
+        assert!(args.contains(&"/home/u/.cargo:/tmp/ward-cargo:ro".to_string()));
+        // And it still never mounts the docker socket.
+        assert!(!args.join(" ").contains("docker.sock"));
+    }
+
+    #[test]
+    fn docker_client_without_daemon_is_unknown_not_fail() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let cfg = WardConfig::default();
+        // Shim: `info` renders nothing (daemon down), `run` emits the
+        // daemon-unreachable error. The verdict must be Unknown (F13), and
+        // `info` alone (empty ServerVersion) must not look "available".
+        let shim = dir.path().join("docker");
+        // `info` reports a version (daemon looked alive), then `run` hits
+        // the daemon-unreachable race — verdict must still be Unknown.
+        std::fs::write(
+            &shim,
+            "#!/bin/sh\nif [ \"$1\" = \"info\" ]; then echo 27.5.1; exit 0; fi\necho \"docker: Cannot connect to the Docker daemon at unix:///x.sock. Is the docker daemon running?.\" >&2\nexit 1\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let r = run_sandbox(shim.to_str().unwrap(), repo.path(), &cfg);
+        assert_eq!(r.verdict, CatchVerdict::Unknown, "daemon down ⇒ unknown: {r:?}");
+        assert!(r.note.contains("守护进程"), "note: {}", r.note);
+    }
+
+    #[test]
+    fn docker_available_requires_real_server_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let shim = dir.path().join("docker");
+        std::fs::write(&shim, "#!/bin/sh\nexit 0\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        // exit 0 with EMPTY version output must not count as available.
+        assert!(!docker_available(shim.to_str().unwrap()));
     }
 
     #[test]
