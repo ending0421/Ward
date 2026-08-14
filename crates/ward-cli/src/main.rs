@@ -375,7 +375,7 @@ fn main() -> Result<()> {
             let cfg = load_config(&repo);
             let store = open_store(&repo)?;
             let provider = ward_core::llm::http_llm_from_env();
-            let hint = ward_core::intent::intent_drift_check(
+            let hint = match ward_core::intent::intent_drift_check(
                 &repo,
                 &store,
                 &cfg,
@@ -383,7 +383,17 @@ fn main() -> Result<()> {
                 &base,
                 &head,
                 provider.as_deref(),
-            )?;
+            ) {
+                Ok(h) => h,
+                // Fail-open: bad refs / unindexed repo degrade to a honest
+                // "not executed" hint instead of a hard error.
+                Err(e) => ward_core::intent::DriftHint {
+                    executed: false,
+                    partition: "llm_soft".into(),
+                    hints: Vec::new(),
+                    note: format!("M4-b 未执行：{e}"),
+                },
+            };
             if json {
                 println!("{}", serde_json::to_string_pretty(&hint)?);
             } else {
