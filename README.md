@@ -30,6 +30,27 @@ catalog, metrics with graduation thresholds, competitive analysis — lives in
 | Phase 2 | M3 sandbox adjudication + M4 assertions + M2 narration (anchor-validated, F6 fallback) + M4-b intent drift + api_compat orchestration | ✅ implemented (LLM via `WARD_LLM_URL`; L3 hashing embedder with pluggable provider trait; Rust api_compat via cargo-semver-checks) |
 | Phase 3 | Five grammars + LanguageSpec, M5 context cards, M6 duplicate clustering | ✅ implemented |
 
+## One-line install (Claude Code / Codex / Cursor)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/ending0421/Ward/master/scripts/install.sh | sh
+```
+
+What it does: downloads the official release binary for your platform,
+verifies it against SHA256SUMS.txt, links `ward`/`ward-mcp` into
+`~/.local/bin`, and registers the MCP server with the tools it finds:
+
+| Tool | Registration | Verification |
+| :--- | :--- | :--- |
+| Claude Code | `claude mcp add --scope user ward` | `claude mcp list` → `ward ✔ Connected` |
+| Codex | `[mcp_servers.ward]` in `~/.codex/config.toml` | `codex mcp list` |
+| Cursor | project `.cursor/mcp.json` (project mode) or UI steps (global) | Settings → MCP |
+
+Options: `--project` (project scope: `.mcp.json`, `.cursor/mcp.json`,
+`.claude/settings.json` hooks, `.codex/config.toml`), `--no-mcp` (binaries
+only), `--uninstall` (removes binaries and registrations). Pin a version
+with `VERSION=v0.1.0 sh scripts/install.sh`.
+
 ## Quick start
 
 ```bash
