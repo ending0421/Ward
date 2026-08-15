@@ -2,7 +2,7 @@
 //! actually did in the next commit, instead of trusting its self-report.
 //!
 //! Causal direction (spec §3-M1, fixed in v0.5.0):
-//! ```
+//! ```text
 //! inferred_action =
 //!   accepted   := next commit did NOT introduce a symbol similar to top-1
 //!                 AND did add a call/mention edge to the top-1 symbol
