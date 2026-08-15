@@ -53,38 +53,54 @@ fn run_with_timeout(cmd: &mut Command, timeout: Duration) -> (bool, String, Stri
     let Ok(mut child) = cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn() else {
         return (false, String::new(), "failed to spawn".into());
     };
+    // Drain both pipes on reader threads from the very start. Reading only
+    // after the child exits deadlocks: once the child fills the OS pipe
+    // buffer (~64KiB on macOS) it blocks in write(), never exits, and a real
+    // pass gets misreported as a timeout.
+    let out_pipe = read_pipe(child.stdout.take());
+    let err_pipe = read_pipe(child.stderr.take());
     let deadline = start + timeout;
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
-                let out = read_all(child);
-                return (status.success(), out.0, out.1);
+                // The child is gone, so both pipe write ends are closed and
+                // the readers see EOF — join cannot hang here.
+                let out = out_pipe.join().unwrap_or_default();
+                let err = err_pipe.join().unwrap_or_default();
+                return (status.success(), out, err);
             }
             Ok(None) => {
                 if Instant::now() >= deadline {
                     let _ = child.kill();
                     let _ = child.wait();
+                    // kill+wait closes the child's pipe write ends, so the
+                    // readers see EOF and return — join so they never leak.
+                    let _ = out_pipe.join();
+                    let _ = err_pipe.join();
                     return (false, String::new(), "timeout".into());
                 }
                 std::thread::sleep(Duration::from_millis(50));
             }
+            // try_wait failing leaves the child's liveness unknown; joining
+            // here could hang on a live writer, so return without the pipes.
             Err(_) => return (false, String::new(), "wait error".into()),
         }
     }
 }
 
-fn read_all(child: std::process::Child) -> (String, String) {
-    let mut child = child;
-    use std::io::Read;
-    let mut out = String::new();
-    let mut err = String::new();
-    if let Some(mut o) = child.stdout.take() {
-        let _ = o.read_to_string(&mut out);
-    }
-    if let Some(mut e) = child.stderr.take() {
-        let _ = e.read_to_string(&mut err);
-    }
-    (out, err)
+/// Drain one child pipe on its own thread until EOF; the JoinHandle yields
+/// the collected text. Must be joined only once the write end is provably
+/// closed (child exited, or killed+reaped).
+fn read_pipe<R: std::io::Read + Send + 'static>(
+    pipe: Option<R>,
+) -> std::thread::JoinHandle<String> {
+    std::thread::spawn(move || {
+        let mut text = String::new();
+        if let Some(mut pipe) = pipe {
+            let _ = pipe.read_to_string(&mut text);
+        }
+        text
+    })
 }
 
 fn tail(s: &str, lines: usize) -> String {
@@ -476,6 +492,24 @@ mod tests {
             r.verdict,
             CatchVerdict::Unknown,
             "F13: no sandbox ⇒ unknown"
+        );
+    }
+
+    #[test]
+    fn large_child_output_is_a_real_pass_not_a_timeout() {
+        // A child that writes ~1MiB (far beyond the macOS 64KiB pipe buffer)
+        // and exits 0 must be reported as a pass. Reading the pipes only
+        // after exit deadlocks the child in write() once the buffer fills,
+        // turning a pass into a bogus timeout.
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "yes '0123456789012345678901234567890123456789' | head -c 1048576"]);
+        let (ok, stdout, stderr) = run_with_timeout(&mut cmd, Duration::from_secs(15));
+        assert!(ok, "expected a real pass, stderr: {stderr}");
+        assert!(stderr.is_empty(), "stderr: {stderr}");
+        assert!(
+            stdout.len() >= 1024 * 1024,
+            "expected >=1MiB drained, got {}",
+            stdout.len()
         );
     }
 
