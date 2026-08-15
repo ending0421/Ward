@@ -211,10 +211,28 @@ fn form_check_ci_posture_is_fail_closed() {
         .output()
         .unwrap();
     assert!(git.status.success());
-    let out = ward(&["form-check", "--repo", ".", "--spec", "specs/task.md", "--ci"], repo.path());
-    assert_eq!(out.status.code(), Some(1), "--ci must exit 1 on fail: {}", String::from_utf8_lossy(&out.stderr));
+    let out = ward(
+        &[
+            "form-check",
+            "--repo",
+            ".",
+            "--spec",
+            "specs/task.md",
+            "--ci",
+        ],
+        repo.path(),
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "--ci must exit 1 on fail: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     // Advisory mode (no --ci) must not exit nonzero.
-    let out = ward(&["form-check", "--repo", ".", "--spec", "specs/task.md"], repo.path());
+    let out = ward(
+        &["form-check", "--repo", ".", "--spec", "specs/task.md"],
+        repo.path(),
+    );
     assert!(out.status.success(), "advisory mode stays fail-open");
 }
 

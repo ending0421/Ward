@@ -411,7 +411,10 @@ mod tests {
         // No cache: no mount, but offline is always forced.
         let args = sandbox_args_with_cache(&cfg, "/repo", None);
         assert!(!args.iter().any(|a| a.contains("/tmp/ward-cargo:ro")));
-        assert!(args.windows(2).any(|w| w == ["-e", "CARGO_NET_OFFLINE=true"]));
+        assert!(
+            args.windows(2)
+                .any(|w| w == ["-e", "CARGO_NET_OFFLINE=true"])
+        );
         // With cache: read-only mount appears.
         let args = sandbox_args_with_cache(&cfg, "/repo", Some("/home/u/.cargo"));
         assert!(args.contains(&"-v".to_string()));
@@ -442,7 +445,11 @@ mod tests {
             std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
         let r = run_sandbox(shim.to_str().unwrap(), repo.path(), &cfg);
-        assert_eq!(r.verdict, CatchVerdict::Unknown, "daemon down ⇒ unknown: {r:?}");
+        assert_eq!(
+            r.verdict,
+            CatchVerdict::Unknown,
+            "daemon down ⇒ unknown: {r:?}"
+        );
         assert!(r.note.contains("守护进程"), "note: {}", r.note);
     }
 
