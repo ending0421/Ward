@@ -13,15 +13,15 @@
 3. **Catch + Form Check** — deterministic verification: real test runs in a
    sandbox, and machine-checkable spec assertions guarding intent drift.
 
-One Rust binary, two postures: a local **MCP daemon** (inner loop, fail-open,
-never blocks) and a **CLI for CI** (outer loop, fail-closed: assertion
-failure is red, `unknown` is never green).
+Two Rust binaries, two postures: a local **MCP daemon** (`ward-mcp`,
+inner loop, fail-open, never blocks) and a **CLI for CI** (`ward`, outer
+loop, fail-closed: assertion failure is red, `unknown` is never green).
 
 The full design — seven iron laws, four-layer fingerprints, failure-mode
 catalog, metrics with graduation thresholds, competitive analysis — lives in
 [docs/ward-tech-spec-v0.6.1.md](docs/ward-tech-spec-v0.6.1.md).
 
-## Status: Phase 0/1 core complete
+## Status: Phase 0–3 implemented
 
 | Spec phase | Scope | Status |
 | :--- | :--- | :--- |
@@ -54,7 +54,7 @@ with `VERSION=v0.1.0 sh scripts/install.sh`.
 ## Quick start
 
 ```bash
-cargo build --release            # single static binary
+cargo build --release            # ward + ward-mcp binaries
 
 # initialize a starter config
 ./target/release/ward init --repo .
@@ -82,8 +82,10 @@ cargo build --release            # single static binary
 # outer-loop adjudication in a Docker sandbox (M3; 'unknown' without Docker)
 ./target/release/ward verify --full --repo .
 
-# evaluate a task spec's assertions (M4, inner-loop semantics)
-./target/release/ward form-check --spec specs/2026-0813-debounce.md --repo .
+# evaluate a task spec's assertions (M4; add --ci for the fail-closed outer
+# loop — exit 1 on any `fail`, exit 2 on any `unknown`)
+./target/release/ward form-check --spec specs/2026-08-gov-data.md --repo .
+# (an example spec ships at examples/specs/2026-0813-debounce.md)
 
 # record the agent's self-reported action for an advisory (M1 feedback loop)
 ./target/release/ward action <advisory_id> accepted
@@ -103,6 +105,18 @@ top_k = 5                               # matches per advisory
 [thresholds]
 strong = 0.92   # initial value — recalibrate weekly against the golden set
 weak = 0.80
+
+[clusters]
+exclude_tests = true    # M6: skip #[cfg(test)] mod tests / tests/ near-dupes
+
+[lint]                  # catch-run inner-loop precheck (empty command disables)
+command = "cargo check --quiet"
+timeout_secs = 120
+
+[sandbox]               # verify --full outer-loop adjudication (Docker)
+verify_command = "cargo test --quiet"
+image = "rust:1-bookworm"
+memory = "2g"
 ```
 
 ### Connect as an MCP server (Claude Code)
@@ -156,7 +170,7 @@ cannot inject context from PreToolUse
 | L1 | `struct_hash` — hash of the canonical form (identifiers→`ID`, literals→`LIT`, comments dropped) | clones + pure rename + literal substitution |
 | L2 | `sig_simhash` / `simhash` — Charikar simhash over subtree features (DECKARD-inspired variant) | structural near-duplicates; signature-shaped queries align against the signature simhash |
 | Block | sliding statement-window simhashes inside function bodies | in-function duplication (the granularity symbol-level fingerprints cannot see) |
-| L3 | embeddings (not yet compiled in) | semantic clones — recall only, never thresholds |
+| L3 | embeddings — hashing embedder (compiled in, recall supplement only); learned semantic embeddings not yet compiled in | semantic clones — recall only, never thresholds |
 
 Pipeline: L1 equality → BM25 recall → L2 simhash ranking → thresholded
 grades. **Strong grades require fingerprint evidence**; text-only matches are
@@ -182,27 +196,71 @@ WARD_LLM_URL=https://api.example.com/v1/chat/completions \
 ./target/release/ward intent-check --requirement "实现防抖函数" --repo .
 ```
 
+### Governance loop (data & calibration)
+
+Spot advisories feed a feedback loop that calibrates Ward's own
+thresholds — the only non-automatable step is a weekly human verdict on the
+golden set (~5 min):
+
+```bash
+ward infer --repo .                 # objective channel: infer adoption
+                                    # outcomes for pending advisories from
+                                    # the next commit (post-commit hook)
+ward setup-hooks --repo .           # install the git post-commit hook that
+                                    # auto-runs `ward infer` (--remove to undo)
+ward label next --repo .            # golden-set labeling: next unlabeled match
+ward label set <advisory> <match> y # record a human verdict (y = relevant, n = not)
+ward calibrate --repo .             # Wilson-interval threshold calibration
+ward snapshot --repo .              # idempotent daily trend snapshot
+ward stats --repo .                 # governance report: adoption, clusters,
+                                    # constraint decay (also --json)
+```
+
+### Unattended operation & remote diagnostics
+
+```bash
+ward daemon --repo .                # background worker: watch→index,
+                                    # poll→infer, daily snapshot, weekly metrics
+ward service install --repo .       # launchd (macOS) / systemd (Linux) service;
+                                    # --dry-run prints the unit; uninstall removes
+ward doctor --repo . --bundle       # health probe, privacy-redacted portable bundle
+ward report <advisory-id> --include-snippets   # full context dump for one advisory
+ward issue --title "..." --bundle <bundle> --yes   # compose a GitHub issue
+                                    # (default dry-run; nothing is posted without --yes)
+```
+
 ## How Replay works (deterministic, anti-hallucination)
 
 `git diff base..head` → tree-sitter parse of both versions → symbol alignment
 → classification (`added / removed / signature_changed / body_changed /
 doc_only / moved`) → 1-hop impact via static mention edges (**lower-bound
 estimates** — reports say "at least N") → risk markers (public API changes,
-high fan-in, tests not updated, suspected duplicates). The LLM narration
-layer is deliberately *not* in this codebase: every line of output here is a
-deterministic fact with a `path:line` anchor (the F6 structured fallback).
+high fan-in, tests not updated, suspected duplicates). The structured list is
+100% deterministic facts with `path:line` anchors. An optional LLM narration
+layer (`--narrate`, requires `WARD_LLM_URL`) can add prose on top — every
+sentence is anchor-validated against those facts, and any failure falls back
+to the structured list (F6): the LLM narrates, never adjudicates.
 
 ## Repository layout
 
 ```
 crates/
-  ward-core/   # engine: config, fingerprints, indexer, search, diff, spec, verify, store
-  ward-cli/    # the `ward` binary (init/index/spot/replay/catch-run/verify/form-check/action)
-  ward-mcp/    # MCP daemon (stdio, official Rust SDK)
+  ward-core/   # engine: lang, normalize, fingerprint, index, search, diff,
+               # spec, verify, compat, infer, label, calibrate, stats, cluster,
+               # context, doctor, report, daemon, store, config, embedding,
+               # fresh, git, intent, llm, narrate
+  ward-cli/    # the `ward` binary (23 subcommands: init/index/spot/replay/
+               # catch-run/verify/form-check/compat-check/infer/label/calibrate/
+               # snapshot/stats/daemon/service/doctor/report/issue/setup-hooks/
+               # intent-check/card/clusters/action)
+  ward-mcp/    # MCP daemon (stdio, 10 tools, official Rust SDK)
 hooks/         # Claude Code PreToolUse/PostToolUse scripts
-examples/      # example spec file + Claude Code settings + starter config
-.github/       # CI: fmt/clippy/test, self-dogfood spot, jscpd duplication baseline
-docs/          # the design spec (v0.6.1)
+examples/      # example spec + Claude Code settings
+specs/         # active task specs (form-check gate input)
+scripts/       # install.sh, verify-meaningful.sh, gen-release-notes.sh
+.github/       # CI: reusable quality gate, spec gate, 5-target release pipeline
+docs/          # design spec (v0.6.1), usage guide, acceptance criteria,
+               # curated release notes, metrics baseline
 ```
 
 ## Design principles (the seven iron laws)
@@ -243,8 +301,9 @@ driven**:
    for `-rc`/`-beta` tags, and asset re-upload (--clobber) when re-running.
 
 ```bash
-# Cut a release:
-git tag v0.1.0 && git push origin v0.1.0
+# Cut a release (tag must match the workspace version in Cargo.toml, and the
+# curated notes file docs/release-notes/vX.Y.Z.md must already be merged):
+git tag v0.4.0 && git push origin v0.4.0
 # → quality gate → 5-target build → notes → GitHub Release
 ```
 
@@ -257,7 +316,9 @@ and asserts the engine recalls the exact clone (L1), the copy-then-modify
 adversarial semantics: F3 skips broken files, uncommitted edits mark
 advisories `stale`, `verify --full` without a sandbox is `unknown` (never a
 fake green), `must_pass` defers to CI, `api_compat` is `unknown` without its
-tool, and `intent-check` without an LLM reports "not executed".
+tool (in CI, `form-check --ci` adjudicates it for real with
+cargo-semver-checks), and `intent-check` without an LLM reports
+"not executed".
 
 ```bash
 scripts/verify-meaningful.sh $(command -v ward)
@@ -274,13 +335,19 @@ rate, and constraint-decay measurements on dogfood repositories.
 cargo fmt --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
-cargo llvm-cov --workspace --summary-only   # coverage (requires llvm-tools-preview)
+cargo llvm-cov --workspace --summary-only   # coverage (cargo-llvm-cov, needs
+                                            # llvm-tools-preview; CI gate ≥85% lines)
+scripts/verify-meaningful.sh $(command -v ward)   # 11-check meaningfulness harness
 ```
 
-Test coverage policy: core engine logic (fingerprints, search, replay, spec,
-index, store) is exercised with positive and negative cases per functional
-path — unit tests inside modules plus an end-to-end suite that drives real
-temporary git repositories through the whole pipeline.
+Dogfood discipline (see [AGENTS.md](AGENTS.md)): new functions go through
+`ward spot` first, every change ends with `ward catch-run --repo .` and a
+fresh `ward index --repo .`, and every received advisory gets a disposition
+via `ward action`. Test coverage policy: core engine logic (fingerprints,
+search, replay, spec, index, store) is exercised with positive and negative
+cases per functional path — unit tests inside modules plus an end-to-end
+suite that drives real temporary git repositories through the whole
+pipeline.
 
 ## License
 
