@@ -75,8 +75,14 @@ fi
 # ---------------------------------------------------------------- download
 if [ "$VERSION" = "latest" ]; then
   info "resolving latest release…"
-  VERSION="$(curl -fsSL "https://api.github.com/repos/$REPO/releases/latest" \
-    | python3 -c 'import json,sys; print(json.load(sys.stdin)["tag_name"])' 2>/dev/null || true)"
+  # git protocol, not the GitHub API (no rate limit, works unauthenticated).
+  VERSION="$(git ls-remote --tags --refs "https://github.com/$REPO.git" 2>/dev/null \
+    | sed 's|.*refs/tags/||' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' \
+    | python3 -c 'import sys
+ts = [t.strip() for t in sys.stdin if t.strip()]
+if ts:
+    ts.sort(key=lambda t: tuple(int(x) for x in t[1:].split(".")))
+    print(ts[-1])' 2>/dev/null || true)"
   [ -n "$VERSION" ] || VERSION="v0.1.0"
 fi
 BASE="https://github.com/$REPO/releases/download/$VERSION"
