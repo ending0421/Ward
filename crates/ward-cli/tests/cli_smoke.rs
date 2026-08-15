@@ -237,6 +237,36 @@ fn form_check_ci_posture_is_fail_closed() {
 }
 
 #[test]
+fn setup_hooks_and_infer_roundtrip() {
+    let repo = repo_with_rust();
+    let out = ward(&["setup-hooks", "--repo", "."], repo.path());
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let hook = repo.path().join(".git/hooks/post-commit");
+    let content = std::fs::read_to_string(&hook).unwrap();
+    assert!(content.contains("ward infer"), "hook content: {content}");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&hook).unwrap().permissions().mode();
+        assert!(mode & 0o111 != 0, "hook must be executable");
+    }
+    // infer on a repo with no pending advisories: zero-considered report.
+    let out = ward(&["infer", "--repo", ".", "--json"], repo.path());
+    assert!(out.status.success());
+    let json: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).unwrap();
+    assert_eq!(json["considered"], 0);
+    // removal is idempotent and honest.
+    let out = ward(&["setup-hooks", "--repo", ".", "--remove"], repo.path());
+    assert!(out.status.success());
+    assert!(!hook.exists());
+}
+
+#[test]
 fn catch_run_reports_pass_for_true_command() {
     let repo = repo_with_rust();
     // Override the lint command to something deterministic.

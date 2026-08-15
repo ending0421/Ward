@@ -105,6 +105,21 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// Infer adoption outcomes for pending advisories from the next commit
+    /// (spec §3-M1 objective channel)
+    Infer {
+        #[arg(default_value = ".", long)]
+        repo: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Install (or remove) the git post-commit hook that auto-runs `ward infer`
+    SetupHooks {
+        #[arg(default_value = ".", long)]
+        repo: PathBuf,
+        #[arg(long)]
+        remove: bool,
+    },
     /// Soft intent-drift comparison: original requirement vs change facts
     /// (M4-b, LLM partition; requires WARD_LLM_URL, else "not executed")
     IntentCheck {
@@ -379,6 +394,47 @@ fn main() -> Result<()> {
             }
             if report.verdict == ward_core::compat::CompatVerdict::Unknown {
                 std::process::exit(2);
+            }
+        }
+        Cmd::Infer { repo, json } => {
+            let store = open_store(&repo)?;
+            let cfg = load_config(&repo);
+            let report = ward_core::infer::infer_pending(&repo, &store, &cfg)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!(
+                    "inferred {} advisories: {} accepted / {} reused-ish / {} rejected / {} unknown",
+                    report.considered,
+                    report.accepted,
+                    report.reused_ish,
+                    report.rejected,
+                    report.unknown
+                );
+            }
+        }
+        Cmd::SetupHooks { repo, remove } => {
+            let hook_path = repo.join(".git/hooks/post-commit");
+            if remove {
+                match std::fs::remove_file(&hook_path) {
+                    Ok(()) => println!("removed {}", hook_path.display()),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        println!("no hook at {}", hook_path.display());
+                    }
+                    Err(e) => anyhow::bail!("removing hook: {e}"),
+                }
+            } else {
+                if !repo.join(".git").is_dir() {
+                    anyhow::bail!("{} is not a git repository", repo.display());
+                }
+                let script = "#!/bin/sh\n# Ward post-commit: infer adoption outcomes (fail-open, never blocks).\nexec ward infer --repo \"$(git rev-parse --show-toplevel)\"\n";
+                std::fs::write(&hook_path, script)?;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    std::fs::set_permissions(&hook_path, std::fs::Permissions::from_mode(0o755))?;
+                }
+                println!("installed {}", hook_path.display());
             }
         }
         Cmd::IntentCheck {
