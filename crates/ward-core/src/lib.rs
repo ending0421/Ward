@@ -27,6 +27,7 @@ pub mod normalize;
 pub mod report;
 pub mod search;
 pub mod spec;
+pub mod spotfile;
 pub mod stats;
 pub mod store;
 pub mod verify;

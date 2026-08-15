@@ -36,6 +36,23 @@ jobs:
           assert r["matches"], "dogfood spot must match its own simhash"
           print("dogfood spot OK:", [(m["path"], m["lines"], m["similarity"]) for m in r["matches"]])
           EOF
+      - name: Hook smoke (PostToolUse auto spot-file + additionalContext)
+        run: |
+          set -euo pipefail
+          WARD="$(pwd)/target/release/ward"
+          TMP="$(mktemp -d)"
+          cd "$TMP"
+          git init -q .
+          git config user.email t@t
+          git config user.name t
+          mkdir -p src
+          printf 'pub fn debounce(f: &dyn Fn(u64), ms: u64) -> u8 { f(ms); 0 }\n' > src/lib.rs
+          git add -A && git commit -qm c1
+          "$WARD" index --repo . >/dev/null
+          printf 'pub fn debounce2(f: &dyn Fn(u64), ms: u64) -> u8 { f(ms); 0 }\n' > src/new.rs
+          OUT="$(WARD_BIN="$WARD" WARD_REPO_ROOT="$TMP" "$OLDPWD/hooks/posttooluse-spot.sh" Write '{"file_path":"src/new.rs"}')"
+          echo "$OUT" | python3 -c 'import json,sys; d=json.load(sys.stdin); assert "debounce" in d["additionalContext"], d'
+          echo "hook smoke OK"
 
   spec-gate:
     name: task spec gate (form-check --ci)
