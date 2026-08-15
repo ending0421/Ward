@@ -90,6 +90,10 @@ enum Cmd {
         repo: PathBuf,
         #[arg(long)]
         json: bool,
+        /// Outer-loop posture (P7): exit 1 on any `fail`, exit 2 on any
+        /// `unknown` — for CI. Without it, form-check is advisory.
+        #[arg(long)]
+        ci: bool,
     },
     /// API/ABI compatibility adjudication against a base rev (M4, outer
     /// loop: cargo-semver-checks for Rust, unknown for other languages)
@@ -303,6 +307,7 @@ fn main() -> Result<()> {
             base,
             repo,
             json,
+            ci,
         } => {
             let cfg = load_config(&repo);
             let store = open_store(&repo)?;
@@ -341,6 +346,17 @@ fn main() -> Result<()> {
                     println!("  [issue] {issue}");
                 }
                 println!("note: 本预检非裁决；CI 外环结果为准");
+            }
+            if ci {
+                use ward_core::spec::Verdict;
+                let any_fail = results.iter().any(|r| r.verdict == Verdict::Fail);
+                let any_unknown = results.iter().any(|r| r.verdict == Verdict::Unknown);
+                if any_fail {
+                    std::process::exit(1); // 外环 fail-closed（P7）
+                }
+                if any_unknown {
+                    std::process::exit(2); // unknown 不绿灯（P7）
+                }
             }
             let _ = cfg;
         }
