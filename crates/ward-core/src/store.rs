@@ -10,7 +10,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 /// Current schema version. Bump on any schema change; mismatches trigger a
 /// full rebuild instead of a migration (rebuild is cheap and always safe).
-pub const SCHEMA_VERSION: i64 = 3;
+pub const SCHEMA_VERSION: i64 = 4;
 
 /// One indexed symbol (function / struct / enum / trait / method, …).
 #[derive(Debug, Clone, PartialEq)]
@@ -44,6 +44,32 @@ pub struct Block {
     pub simhash: u64,
     pub kind: String,
     pub commit_sha: String,
+}
+
+/// One match-level golden-set label (spec §9).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Label {
+    pub id: Option<i64>,
+    pub advisory_id: String,
+    pub match_index: i64,
+    pub query_hash: Option<String>,
+    pub language: Option<String>,
+    pub kind: Option<String>,
+    pub similarity: Option<f64>,
+    pub verdict: String,
+    pub ts: i64,
+}
+
+/// One daily trend snapshot (spec §9).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Snapshot {
+    pub ts: i64,
+    pub symbols: i64,
+    pub clusters: i64,
+    pub advisories: i64,
+    pub labels: i64,
+    pub contract_runs: i64,
+    pub contract_pass: i64,
 }
 
 /// An advisory outcome record (M1 feedback loop, spec §4).
@@ -157,6 +183,33 @@ fn create_schema(conn: &Connection) -> Result<()> {
             detail     TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_contract_runs_spec ON contract_runs(spec_path);
+
+        -- Golden-set labels (spec §9): match-level human verdicts feeding
+        -- threshold calibration.
+        CREATE TABLE IF NOT EXISTS labels (
+            id          INTEGER PRIMARY KEY,
+            advisory_id TEXT NOT NULL,
+            match_index INTEGER NOT NULL,
+            query_hash  TEXT,
+            language    TEXT,
+            kind        TEXT,
+            similarity  REAL,
+            verdict     TEXT NOT NULL,      -- y / n
+            ts          INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_labels_verdict ON labels(verdict);
+        CREATE INDEX IF NOT EXISTS idx_labels_lang ON labels(language);
+
+        -- Trend snapshots (spec §9): one row per day, idempotent.
+        CREATE TABLE IF NOT EXISTS snapshots (
+            ts               INTEGER PRIMARY KEY,   -- day key (unix day)
+            symbols          INTEGER NOT NULL,
+            clusters         INTEGER NOT NULL,
+            advisories       INTEGER NOT NULL,
+            labels           INTEGER NOT NULL,
+            contract_runs    INTEGER NOT NULL,
+            contract_pass    INTEGER NOT NULL
+        );
 
         -- per-file content hashes for the per-file freshness protocol (spec §5),
         -- plus mtime/size for the incremental-indexing skip (spec §5.2)
@@ -386,6 +439,113 @@ impl Store {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
+    // ---- golden-set labels (spec §9) --------------------------------------
+
+    pub fn record_label(&self, l: &Label) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO labels (advisory_id, match_index, query_hash, language, kind, similarity, verdict, ts)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+            params![
+                l.advisory_id,
+                l.match_index,
+                l.query_hash,
+                l.language,
+                l.kind,
+                l.similarity,
+                l.verdict,
+                l.ts,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn label_count(&self) -> Result<i64> {
+        Ok(self
+            .conn
+            .query_row("SELECT COUNT(*) FROM labels", [], |r| r.get(0))?)
+    }
+
+    /// Labels grouped by (language, kind, verdict) for calibration reports.
+    pub fn label_matrix(&self) -> Result<Vec<(String, String, String, i64, f64)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT COALESCE(language,'?'), COALESCE(kind,'?'), verdict,
+                    COUNT(*), COALESCE(AVG(similarity),0)
+             FROM labels GROUP BY 1,2,3 ORDER BY 1,2,3",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// True when this (advisory_id, match_index) is already labeled.
+    pub fn is_labeled(&self, advisory_id: &str, match_index: i64) -> Result<bool> {
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM labels WHERE advisory_id = ?1 AND match_index = ?2",
+            params![advisory_id, match_index],
+            |r| r.get(0),
+        )?;
+        Ok(n > 0)
+    }
+
+    // ---- snapshots (spec §9) ----------------------------------------------
+
+    pub fn record_snapshot(&self, snap: &Snapshot) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO snapshots
+               (ts, symbols, clusters, advisories, labels, contract_runs, contract_pass)
+             VALUES (?1,?2,?3,?4,?5,?6,?7)",
+            params![
+                snap.ts,
+                snap.symbols,
+                snap.clusters,
+                snap.advisories,
+                snap.labels,
+                snap.contract_runs,
+                snap.contract_pass,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn snapshots(&self) -> Result<Vec<Snapshot>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT ts, symbols, clusters, advisories, labels, contract_runs, contract_pass
+             FROM snapshots ORDER BY ts ASC",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(Snapshot {
+                ts: r.get(0)?,
+                symbols: r.get(1)?,
+                clusters: r.get(2)?,
+                advisories: r.get(3)?,
+                labels: r.get(4)?,
+                contract_runs: r.get(5)?,
+                contract_pass: r.get(6)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn counts(&self) -> Result<(i64, i64, i64, i64)> {
+        // (symbols, advisories, contract_runs, contract_pass)
+        let symbols: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM symbols", [], |r| r.get(0))?;
+        let advisories: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM advisories", [], |r| r.get(0))?;
+        let runs: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM contract_runs", [], |r| r.get(0))?;
+        let pass: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM contract_runs WHERE verdict = 'pass'",
+            [],
+            |r| r.get(0),
+        )?;
+        Ok((symbols, advisories, runs, pass))
+    }
+
     // ---- freshness (spec §5) ---------------------------------------------
 
     pub fn set_file_hash(&self, file_path: &str, hash: &str) -> Result<()> {
@@ -472,6 +632,16 @@ impl Store {
             ],
         )?;
         Ok(())
+    }
+
+    /// Advisories awaiting outcome inference: (id, ts, result_json).
+    pub fn pending_inferences(&self) -> Result<Vec<(String, i64, String)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, ts, COALESCE(result_json,'[]') FROM advisories
+             WHERE tool = 'spot' AND inferred_action IS NULL ORDER BY ts ASC",
+        )?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
     /// Update the self-reported agent action for an advisory.

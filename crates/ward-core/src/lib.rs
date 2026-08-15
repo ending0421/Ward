@@ -3,6 +3,7 @@
 //! Everything in this crate is a *derived view* over `git + working tree`
 //! (design law P1). Nothing here owns truth and nothing here writes code.
 
+pub mod attribution;
 pub mod cluster;
 pub mod compat;
 pub mod config;
@@ -13,6 +14,7 @@ pub mod fingerprint;
 pub mod fresh;
 pub mod git;
 pub mod index;
+pub mod infer;
 pub mod intent;
 pub mod lang;
 pub mod llm;
