@@ -233,6 +233,7 @@ mod tests {
             struct_hash: "s".into(),
             simhash: 1,
             sig_simhash: 1,
+            in_test: false,
             commit_sha: "c".into(),
         }];
         let dir = tempfile::tempdir().unwrap();

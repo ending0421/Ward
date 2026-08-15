@@ -9,6 +9,7 @@ pub mod cluster;
 pub mod compat;
 pub mod config;
 pub mod context;
+pub mod daemon;
 pub mod diff;
 pub mod embedding;
 pub mod fingerprint;

@@ -60,14 +60,53 @@ pub fn extract_symbols(
     let mut out = Vec::new();
     let mut cursor = tree.walk();
     for node in tree.root_node().named_children(&mut cursor) {
-        walk_for_symbols(&node, source, spec, &mut out);
+        walk_for_symbols(&node, source, spec, false, &mut out);
     }
     out
 }
 
-fn walk_for_symbols(node: &Node, source: &str, spec: &LanguageSpec, out: &mut Vec<Extracted>) {
+/// Is this node a test module (`#[cfg(test)] mod tests`)?
+fn is_test_module(node: &Node, source: &str) -> bool {
+    if node.kind() != "mod_item" {
+        return false;
+    }
+    let name = node
+        .child_by_field_name("name")
+        .and_then(|n| n.utf8_text(source.as_bytes()).ok())
+        .map(|s| s == "test" || s == "tests")
+        .unwrap_or(false);
+    if !name {
+        return false;
+    }
+    // The `#[cfg(test)]` attribute is a *sibling* of the mod_item (verified
+    // against tree-sitter-rust 0.24), so inspect the previous sibling.
+    let mut prev = node.prev_sibling();
+    while let Some(p) = prev {
+        if p.kind() == "attribute_item" {
+            return p
+                .utf8_text(source.as_bytes())
+                .map(|t| t.contains("cfg(test)"))
+                .unwrap_or(false);
+        }
+        if p.kind() == "line_comment" || p.kind() == "block_comment" {
+            prev = p.prev_sibling();
+            continue;
+        }
+        break;
+    }
+    false
+}
+
+fn walk_for_symbols(
+    node: &Node,
+    source: &str,
+    spec: &LanguageSpec,
+    in_test: bool,
+    out: &mut Vec<Extracted>,
+) {
+    let in_test = in_test || is_test_module(node, source);
     if spec.is_symbol_kind(node.kind()) {
-        if let Some(sym) = symbol_from_node(node, source, spec) {
+        if let Some(sym) = symbol_from_node(node, source, spec, in_test) {
             let mentions = identifier_mentions_in(node, source, spec)
                 .into_iter()
                 .filter(|m| m != &sym.name)
@@ -83,7 +122,7 @@ fn walk_for_symbols(node: &Node, source: &str, spec: &LanguageSpec, out: &mut Ve
     // function bodies are legal in several of Ward's languages.
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
-        walk_for_symbols(&child, source, spec, out);
+        walk_for_symbols(&child, source, spec, in_test, out);
     }
 }
 
@@ -99,7 +138,12 @@ fn name_node_of<'a>(node: &'a Node, spec: &LanguageSpec) -> Option<Node<'a>> {
         .find(|c| spec.is_identifier_kind(c.kind()))
 }
 
-fn symbol_from_node(node: &Node, source: &str, spec: &LanguageSpec) -> Option<Symbol> {
+fn symbol_from_node(
+    node: &Node,
+    source: &str,
+    spec: &LanguageSpec,
+    in_test: bool,
+) -> Option<Symbol> {
     let name_node = name_node_of(node, spec)?;
     let name = name_node.utf8_text(source.as_bytes()).ok()?.to_string();
     let body = node.utf8_text(source.as_bytes()).ok()?.to_string();
@@ -123,6 +167,7 @@ fn symbol_from_node(node: &Node, source: &str, spec: &LanguageSpec) -> Option<Sy
         struct_hash: h.finalize().to_hex().to_string(),
         simhash: fingerprint::simhash(&features),
         sig_simhash: fingerprint::simhash(&sig_features),
+        in_test,
         commit_sha: String::new(), // filled in by the caller
     })
 }
@@ -283,7 +328,13 @@ impl Indexer<'_> {
                 continue;
             }
 
-            let extracted = extract_symbols(&tree, &source, spec);
+            let mut extracted = extract_symbols(&tree, &source, spec);
+            let path_in_test = rel.split('/').any(|seg| seg == "tests");
+            if path_in_test {
+                for e in &mut extracted {
+                    e.symbol.in_test = true;
+                }
+            }
             let mut symbols: Vec<Symbol> = Vec::with_capacity(extracted.len());
             for e in &extracted {
                 let mut sym = e.symbol.clone();
@@ -455,6 +506,27 @@ mod tests {
         let names: Vec<&str> = syms.iter().map(|s| s.symbol.name.as_str()).collect();
         assert!(names.contains(&"Foo"), "got {names:?}");
         assert!(names.contains(&"bar"));
+    }
+
+    #[test]
+    fn test_module_symbols_are_marked_in_test() {
+        let src = r#"
+            pub fn real_fn() {}
+            #[cfg(test)]
+            mod tests {
+                fn helper_a() {}
+                fn helper_b() {}
+            }
+        "#;
+        let tree = fingerprint::parse_rust(src).unwrap();
+        let syms = extract_symbols(&tree, src, &RUST);
+        let real = syms.iter().find(|s| s.symbol.name == "real_fn").unwrap();
+        assert!(!real.symbol.in_test, "production code must not be marked");
+        let helper = syms.iter().find(|s| s.symbol.name == "helper_a").unwrap();
+        assert!(
+            helper.symbol.in_test,
+            "cfg(test) module symbols must be marked"
+        );
     }
 
     #[test]

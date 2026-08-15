@@ -50,7 +50,22 @@ pub const MAX_SYMBOLS: usize = 50_000;
 
 /// Cluster symbols whose full-body simhash similarity is ≥ `threshold`.
 pub fn cluster_duplicates(store: &Store, threshold: f64) -> Result<ClusterReport> {
-    let symbols = store.all_symbols()?;
+    cluster_duplicates_with(store, threshold, true)
+}
+
+/// Cluster with explicit test-exemption control (config-driven).
+pub fn cluster_duplicates_with(
+    store: &Store,
+    threshold: f64,
+    exclude_tests: bool,
+) -> Result<ClusterReport> {
+    let mut symbols = store.all_symbols()?;
+    // Test code is structurally near-duplicate BY DESIGN (spec §3-M6):
+    // exempt it from consolidation analysis by default so it stops drowning
+    // the real signal.
+    if exclude_tests {
+        symbols.retain(|s| !s.in_test);
+    }
     let mut truncated = false;
     let symbols: Vec<_> = if symbols.len() > MAX_SYMBOLS {
         truncated = true;
@@ -208,6 +223,7 @@ mod tests {
             struct_hash: format!("s-{name}"),
             simhash,
             sig_simhash: simhash,
+            in_test: false,
             commit_sha: "c".into(),
         }
     }

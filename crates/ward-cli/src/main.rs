@@ -26,6 +26,20 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
+enum ServiceAction {
+    /// Install the daemon as a background service for this repo
+    Install {
+        #[arg(default_value = ".", long)]
+        repo: PathBuf,
+        /// Print the service unit instead of installing (inspect/test)
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Remove the background service
+    Uninstall,
+}
+
+#[derive(Subcommand)]
 enum LabelAction {
     /// Show the next unlabeled match with its code context
     Next {
@@ -161,6 +175,19 @@ enum Cmd {
         repo: PathBuf,
         #[arg(long)]
         json: bool,
+    },
+    /// Background unattended worker: watch→index, poll→infer, daily
+    /// snapshot, weekly metrics (无感模式)
+    Daemon {
+        #[arg(default_value = ".", long)]
+        repo: PathBuf,
+        #[arg(long, default_value_t = 300)]
+        interval_secs: u64,
+    },
+    /// Install (or remove) the background service (launchd / systemd)
+    Service {
+        #[command(subcommand)]
+        action: ServiceAction,
     },
     /// Install (or remove) the git post-commit hook that auto-runs `ward infer`
     SetupHooks {
@@ -558,6 +585,167 @@ fn main() -> Result<()> {
                 print!("{}", ward_core::stats::render_table(&report));
             }
         }
+        Cmd::Daemon {
+            repo,
+            interval_secs,
+        } => {
+            use notify::Watcher;
+            let (tx, rx) = std::sync::mpsc::channel();
+            let mut watcher = notify::recommended_watcher(tx)?;
+            watcher.watch(&repo, notify::RecursiveMode::Recursive)?;
+            let interval = std::time::Duration::from_secs(interval_secs);
+            let mut last_head = ward_core::git::head_sha(&repo)?;
+            let mut last_day: Option<i64> = None;
+            let mut last_week: Option<u32> = None;
+            let mut dirty_since: Option<std::time::Instant> = None;
+            println!(
+                "ward daemon: watching {} (interval {interval_secs}s)",
+                repo.display()
+            );
+            loop {
+                let deadline = std::time::Instant::now() + interval;
+                while std::time::Instant::now() < deadline {
+                    if rx
+                        .recv_timeout(std::time::Duration::from_millis(500))
+                        .is_ok()
+                    {
+                        dirty_since = Some(std::time::Instant::now());
+                    }
+                }
+                let cfg = load_config(&repo);
+                if dirty_since.take().is_some() {
+                    match ward_core::daemon::run_index_tick(&repo, &cfg) {
+                        Ok(r) => println!(
+                            "[index] {}/{} symbols ({} unchanged)",
+                            r.files_indexed, r.symbols_indexed, r.files_unchanged
+                        ),
+                        Err(e) => eprintln!("[index] skipped (fail-open): {e}"),
+                    }
+                }
+                if let Ok(Some(head)) = ward_core::git::head_sha(&repo) {
+                    if last_head.as_deref() != Some(head.as_str()) {
+                        match ward_core::daemon::run_infer_tick(&repo, &cfg) {
+                            Ok(r) => println!(
+                                "[infer] {} considered / {} accepted / {} rejected",
+                                r.considered, r.accepted, r.rejected
+                            ),
+                            Err(e) => eprintln!("[infer] skipped (fail-open): {e}"),
+                        }
+                        last_head = Some(head);
+                    }
+                }
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or_default();
+                let day = now / 86400;
+                let week = (day / 7) as u32;
+                if last_day != Some(day) {
+                    match ward_core::daemon::run_daily_tick(&repo, &cfg) {
+                        Ok(s) => println!(
+                            "[daily] snapshot symbols={} clusters={}",
+                            s.symbols, s.clusters
+                        ),
+                        Err(e) => eprintln!("[daily] skipped (fail-open): {e}"),
+                    }
+                    last_day = Some(day);
+                }
+                if last_week != Some(week) {
+                    match ward_core::daemon::run_weekly_tick(&repo, &cfg) {
+                        Ok(r) => println!(
+                            "[weekly] clusters={} labels={} jscpd={:?} note={}",
+                            r.clusters, r.labels, r.jscpd, r.calibration_note
+                        ),
+                        Err(e) => eprintln!("[weekly] skipped (fail-open): {e}"),
+                    }
+                    last_week = Some(week);
+                }
+            }
+        }
+        Cmd::Service { action } => match action {
+            ServiceAction::Install { repo, dry_run } => {
+                let repo_abs = std::fs::canonicalize(&repo)?;
+                let bin = std::env::current_exe()?;
+                let unit = launchd_plist(&bin.to_string_lossy(), &repo_abs.to_string_lossy());
+                if dry_run {
+                    println!("{unit}");
+                } else {
+                    #[cfg(target_os = "macos")]
+                    {
+                        let dir = dirs_launch_agents_dir()?;
+                        std::fs::create_dir_all(&dir).ok();
+                        let path = dir.join("com.ward.daemon.plist");
+                        std::fs::write(&path, &unit)?;
+                        let status = std::process::Command::new("launchctl")
+                            .args(["load", "-w"])
+                            .arg(&path)
+                            .status()?;
+                        anyhow::ensure!(status.success(), "launchctl load failed");
+                        println!("installed {} (launchd)", path.display());
+                        println!("日志: ~/.ward/daemon.log；卸载: ward service uninstall");
+                    }
+                    #[cfg(target_os = "linux")]
+                    {
+                        let dir = std::path::PathBuf::from(
+                            std::env::var("XDG_CONFIG_HOME").unwrap_or_else(|_| {
+                                format!("{}/.config", std::env::var("HOME").unwrap_or_default())
+                            }),
+                        )
+                        .join("systemd/user");
+                        std::fs::create_dir_all(&dir).ok();
+                        let path = dir.join("ward-daemon.service");
+                        let unit =
+                            systemd_unit(&bin.to_string_lossy(), &repo_abs.to_string_lossy());
+                        std::fs::write(&path, &unit)?;
+                        let status = std::process::Command::new("systemctl")
+                            .args(["--user", "daemon-reload"])
+                            .status()?;
+                        anyhow::ensure!(status.success(), "systemctl daemon-reload failed");
+                        let status = std::process::Command::new("systemctl")
+                            .args(["--user", "enable", "--now", "ward-daemon.service"])
+                            .status()?;
+                        anyhow::ensure!(status.success(), "systemctl enable --now failed");
+                        println!("installed {} (systemd user unit)", path.display());
+                    }
+                    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+                    anyhow::bail!("service install 仅支持 macOS (launchd) 与 Linux (systemd)");
+                }
+            }
+            ServiceAction::Uninstall => {
+                #[cfg(target_os = "macos")]
+                {
+                    let dir = dirs_launch_agents_dir()?;
+                    let path = dir.join("com.ward.daemon.plist");
+                    if path.exists() {
+                        let _ = std::process::Command::new("launchctl")
+                            .args(["unload", "-w"])
+                            .arg(&path)
+                            .status();
+                        std::fs::remove_file(&path)?;
+                        println!("removed {}", path.display());
+                    } else {
+                        println!("no service installed");
+                    }
+                }
+                #[cfg(target_os = "linux")]
+                {
+                    let _ = std::process::Command::new("systemctl")
+                        .args(["--user", "disable", "--now", "ward-daemon.service"])
+                        .status();
+                    let dir =
+                        std::path::PathBuf::from(std::env::var("XDG_CONFIG_HOME").unwrap_or_else(
+                            |_| format!("{}/.config", std::env::var("HOME").unwrap_or_default()),
+                        ))
+                        .join("systemd/user/ward-daemon.service");
+                    if dir.exists() {
+                        std::fs::remove_file(&dir)?;
+                    }
+                    println!("removed systemd user unit");
+                }
+                #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+                println!("此平台无服务可卸载");
+            }
+        },
         Cmd::SetupHooks { repo, remove } => {
             let hook_path = repo.join(".git/hooks/post-commit");
             if remove {
@@ -690,6 +878,50 @@ fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// The launchd LaunchAgent plist for the unattended daemon (pure, testable).
+fn launchd_plist(bin: &str, repo: &str) -> String {
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>com.ward.daemon</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>{bin}</string>
+        <string>daemon</string>
+        <string>--repo</string>
+        <string>{repo}</string>
+    </array>
+    <key>RunAtLoad</key><true/>
+    <key>KeepAlive</key><true/>
+    <key>StandardOutPath</key><string>{home}/.ward/daemon.log</string>
+    <key>StandardErrorPath</key><string>{home}/.ward/daemon.log</string>
+</dict>
+</plist>
+"#,
+        bin = bin,
+        repo = repo,
+        home = std::env::var("HOME").unwrap_or_default(),
+    )
+}
+
+#[cfg(target_os = "linux")]
+/// The systemd user unit (Linux).
+fn systemd_unit(bin: &str, repo: &str) -> String {
+    format!(
+        "[Unit]\nDescription=Ward unattended daemon\n\n[Service]\nExecStart={bin} daemon --repo {repo}\nRestart=on-failure\n\n[Install]\nWantedBy=default.target\n"
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn dirs_launch_agents_dir() -> anyhow::Result<std::path::PathBuf> {
+    Ok(
+        std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default())
+            .join("Library/LaunchAgents"),
+    )
 }
 
 fn short(sha: &str) -> String {

@@ -73,9 +73,13 @@ pub fn snapshot_now(_repo: &Path, store: &Store, config: &WardConfig) -> Result<
         .map(|d| (d.as_secs() / 86400) as i64)
         .unwrap_or_default();
     let (symbols, advisories, runs, pass) = store.counts()?;
-    let clusters = crate::cluster::cluster_duplicates(store, config.thresholds.strong)?
-        .clusters
-        .len() as i64;
+    let clusters = crate::cluster::cluster_duplicates_with(
+        store,
+        config.thresholds.strong,
+        config.clusters.exclude_tests,
+    )?
+    .clusters
+    .len() as i64;
     let labels = store.label_count()?;
     let snap = Snapshot {
         ts: day,

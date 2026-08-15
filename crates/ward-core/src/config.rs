@@ -76,11 +76,30 @@ impl Default for SandboxConfig {
     }
 }
 
+/// Duplicate-clustering options (M6).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ClustersConfig {
+    /// Exclude symbols inside `#[cfg(test)] mod tests` and files under
+    /// `tests/` — test functions are structurally near-duplicates BY DESIGN
+    /// and would drown the real consolidation signal.
+    pub exclude_tests: bool,
+}
+
+impl Default for ClustersConfig {
+    fn default() -> Self {
+        Self {
+            exclude_tests: true,
+        }
+    }
+}
+
 /// Full repository configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct WardConfig {
     pub thresholds: Thresholds,
+    pub clusters: ClustersConfig,
     /// Path globs to suppress from Spot advisories.
     pub suppress: Vec<String>,
     /// Number of matches returned per advisory.
@@ -96,6 +115,7 @@ impl Default for WardConfig {
     fn default() -> Self {
         Self {
             thresholds: Thresholds::default(),
+            clusters: ClustersConfig::default(),
             suppress: Vec::new(),
             top_k: 5,
             languages: vec!["rust".to_string()],

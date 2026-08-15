@@ -461,6 +461,7 @@ mod tests {
                 struct_hash: "s".into(),
                 simhash: 1,
                 sig_simhash: 1,
+                in_test: false,
                 commit_sha: "c".into(),
             },
             Symbol {
@@ -475,6 +476,7 @@ mod tests {
                 struct_hash: "s2".into(),
                 simhash: 2,
                 sig_simhash: 2,
+                in_test: false,
                 commit_sha: "c".into(),
             },
         ];

@@ -10,7 +10,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 /// Current schema version. Bump on any schema change; mismatches trigger a
 /// full rebuild instead of a migration (rebuild is cheap and always safe).
-pub const SCHEMA_VERSION: i64 = 4;
+pub const SCHEMA_VERSION: i64 = 5;
 
 /// One indexed symbol (function / struct / enum / trait / method, …).
 #[derive(Debug, Clone, PartialEq)]
@@ -28,6 +28,9 @@ pub struct Symbol {
     /// Simhash over the signature subtree (body excluded) — the comparison
     /// target for signature-shaped Spot queries.
     pub sig_simhash: u64,
+    /// True when the symbol lives inside a test module / test file
+    /// (duplicate clustering exempts test code by default).
+    pub in_test: bool,
     pub commit_sha: String,
 }
 
@@ -128,6 +131,7 @@ fn create_schema(conn: &Connection) -> Result<()> {
             struct_hash TEXT NOT NULL,
             simhash     INTEGER NOT NULL,   -- u64 bit pattern (full subtree)
             sig_simhash INTEGER NOT NULL,   -- u64 bit pattern (signature only)
+            in_test     INTEGER NOT NULL DEFAULT 0,
             commit_sha  TEXT NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_symbols_struct ON symbols(struct_hash);
@@ -271,22 +275,46 @@ impl Store {
     }
 
     /// Drop every table and recreate the schema, then stamp the version.
+    ///
+    /// Governance data (advisories / labels / snapshots / contract_runs) is
+    /// NOT derivable from git+files — unlike symbols/blocks/edges. A schema
+    /// rebuild therefore preserves it: derived tables are wiped, governance
+    /// tables are carried across (F1 rebuild loses speed, never truth).
     fn reset(conn: &Connection) -> Result<()> {
+        const GOVERNANCE: &[&str] = &["advisories", "labels", "snapshots", "contract_runs"];
+        conn.execute_batch("BEGIN;")?;
+        for table in GOVERNANCE {
+            conn.execute_batch(&format!(
+                "DROP TABLE IF EXISTS ward_bak_{table};
+                 CREATE TABLE ward_bak_{table} AS SELECT * FROM {table};"
+            ))?;
+        }
         conn.execute_batch(
             "DROP TABLE IF EXISTS symbols;
              DROP TABLE IF EXISTS blocks;
              DROP TABLE IF EXISTS edges;
              DROP TABLE IF EXISTS mentions;
              DROP TABLE IF EXISTS advisories;
+             DROP TABLE IF EXISTS labels;
+             DROP TABLE IF EXISTS snapshots;
              DROP TABLE IF EXISTS contract_runs;
              DROP TABLE IF EXISTS file_hashes;
              DROP TABLE IF EXISTS meta;",
         )?;
         create_schema(conn)?;
+        for table in GOVERNANCE {
+            // Column sets are stable across schema bumps for governance
+            // tables (additive-only policy documented on the struct).
+            conn.execute_batch(&format!(
+                "INSERT INTO {table} SELECT * FROM ward_bak_{table};
+                 DROP TABLE ward_bak_{table};"
+            ))?;
+        }
         conn.execute(
             "INSERT INTO meta (key, value) VALUES ('schema_version', ?1)",
             params![SCHEMA_VERSION.to_string()],
         )?;
+        conn.execute_batch("COMMIT;")?;
         Ok(())
     }
 
@@ -311,8 +339,8 @@ impl Store {
             tx.execute(
                 "INSERT INTO symbols
                    (file_path, language, name, kind, start_byte, end_byte,
-                    body_hash, struct_hash, simhash, sig_simhash, commit_sha)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+                    body_hash, struct_hash, simhash, sig_simhash, in_test, commit_sha)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
                 params![
                     s.file_path,
                     s.language,
@@ -324,6 +352,7 @@ impl Store {
                     s.struct_hash,
                     s.simhash as i64,
                     s.sig_simhash as i64,
+                    s.in_test as i64,
                     s.commit_sha,
                 ],
             )?;
@@ -377,7 +406,7 @@ impl Store {
     pub fn all_symbols(&self) -> Result<Vec<Symbol>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, file_path, language, name, kind, start_byte, end_byte,
-                    body_hash, struct_hash, simhash, sig_simhash, commit_sha
+                    body_hash, struct_hash, simhash, sig_simhash, in_test, commit_sha
              FROM symbols",
         )?;
         let rows = stmt.query_map([], row_to_symbol)?;
@@ -388,7 +417,7 @@ impl Store {
     pub fn symbols_by_struct_hash(&self, hash: &str) -> Result<Vec<Symbol>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, file_path, language, name, kind, start_byte, end_byte,
-                    body_hash, struct_hash, simhash, sig_simhash, commit_sha
+                    body_hash, struct_hash, simhash, sig_simhash, in_test, commit_sha
              FROM symbols WHERE struct_hash = ?1",
         )?;
         let rows = stmt.query_map(params![hash], row_to_symbol)?;
@@ -781,6 +810,7 @@ impl Store {
 fn row_to_symbol(r: &rusqlite::Row<'_>) -> rusqlite::Result<Symbol> {
     let simhash: i64 = r.get(9)?;
     let sig_simhash: i64 = r.get(10)?;
+    let in_test: i64 = r.get(11)?;
     Ok(Symbol {
         id: r.get(0)?,
         file_path: r.get(1)?,
@@ -793,7 +823,8 @@ fn row_to_symbol(r: &rusqlite::Row<'_>) -> rusqlite::Result<Symbol> {
         struct_hash: r.get(8)?,
         simhash: simhash as u64,
         sig_simhash: sig_simhash as u64,
-        commit_sha: r.get(11)?,
+        in_test: in_test != 0,
+        commit_sha: r.get(12)?,
     })
 }
 
@@ -814,6 +845,7 @@ mod tests {
             struct_hash: format!("s-{name}"),
             simhash: 0xDEAD_BEEF,
             sig_simhash: 0xBEEF_DEAD,
+            in_test: false,
             commit_sha: "abc123".into(),
         }
     }

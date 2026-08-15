@@ -19,6 +19,7 @@ serde_json.workspace = true
 clap.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+notify = "8"
 
 [dev-dependencies]
 tempfile = "3"

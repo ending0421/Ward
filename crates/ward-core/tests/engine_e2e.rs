@@ -766,6 +766,7 @@ fn store_rebuilds_on_schema_version_mismatch() {
                     struct_hash: "s".into(),
                     simhash: 1,
                     sig_simhash: 1,
+                    in_test: false,
                     commit_sha: "c".into(),
                 }],
             )
@@ -796,11 +797,105 @@ fn store_rebuilds_on_schema_version_mismatch() {
     let store = Store::open(&db_path).unwrap();
     assert!(
         store.all_symbols().unwrap().is_empty(),
-        "version mismatch must wipe the store (F1)"
+        "version mismatch must wipe derived tables (F1)"
     );
+    // Governance data is NOT derivable and must survive the rebuild.
+    assert_eq!(
+        store.label_count().unwrap(),
+        0,
+        "no labels were seeded in this test"
+    );
+    store
+        .record_advisory(&ward_core::store::Advisory {
+            id: "adv_keep".into(),
+            tool: "spot".into(),
+            ts: 2,
+            query_hash: "q".into(),
+            result_json: "[]".into(),
+            ..Default::default()
+        })
+        .unwrap();
     // Re-stamping still works after the rebuild.
     store.set_last_indexed_sha("abc").unwrap();
     assert_eq!(store.last_indexed_sha().unwrap().unwrap(), "abc");
+}
+
+#[test]
+fn schema_rebuild_preserves_governance_data() {
+    let repo = TestRepo::new();
+    repo.write("lib.rs", "pub fn f() {}\n");
+    repo.commit_all("c1");
+    let db_path = Store::default_path(repo.path());
+    {
+        let mut store = Store::open(&db_path).unwrap();
+        store
+            .replace_file(
+                "lib.rs",
+                &[ward_core::store::Symbol {
+                    id: None,
+                    file_path: "lib.rs".into(),
+                    language: "rust".into(),
+                    name: "f".into(),
+                    kind: "function_item".into(),
+                    start_byte: 0,
+                    end_byte: 1,
+                    body_hash: "b".into(),
+                    struct_hash: "s".into(),
+                    simhash: 1,
+                    sig_simhash: 1,
+                    in_test: false,
+                    commit_sha: "c".into(),
+                }],
+            )
+            .unwrap();
+        store
+            .record_advisory(&ward_core::store::Advisory {
+                id: "adv_keep".into(),
+                tool: "spot".into(),
+                ts: 1,
+                query_hash: "q".into(),
+                result_json: "[]".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        store
+            .record_label(&ward_core::store::Label {
+                id: None,
+                advisory_id: "adv_keep".into(),
+                match_index: 0,
+                query_hash: None,
+                language: None,
+                kind: Some("near".into()),
+                similarity: Some(0.93),
+                verdict: "y".into(),
+                ts: 1,
+            })
+            .unwrap();
+    }
+    {
+        use rusqlite::Connection;
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute(
+            "UPDATE meta SET value = '1' WHERE key = 'schema_version'",
+            [],
+        )
+        .unwrap();
+    }
+    let store = Store::open(&db_path).unwrap();
+    assert!(
+        store.all_symbols().unwrap().is_empty(),
+        "derived data wiped"
+    );
+    assert_eq!(
+        store.label_count().unwrap(),
+        1,
+        "labels survive the rebuild"
+    );
+    assert_eq!(
+        store.advisory_payloads().unwrap().len(),
+        1,
+        "advisories survive the rebuild"
+    );
 }
 
 #[test]

@@ -319,6 +319,33 @@ fn stats_and_calibrate_report_from_seeded_data() {
 }
 
 #[test]
+fn service_dry_run_emits_valid_launchd_unit() {
+    let repo = repo_with_rust();
+    let out = ward(
+        &["service", "install", "--repo", ".", "--dry-run"],
+        repo.path(),
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let unit = String::from_utf8_lossy(&out.stdout);
+    assert!(unit.contains("com.ward.daemon"), "label present");
+    assert!(unit.contains("daemon"), "ProgramArguments includes daemon");
+    assert!(unit.contains("--repo"), "repo argument wired");
+    assert!(unit.contains("RunAtLoad"), "starts at login");
+    assert!(unit.contains("KeepAlive"), "restarts on exit");
+    // Uninstall on a machine with no service is a clean no-op path.
+    let out = ward(&["service", "uninstall"], repo.path());
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
 fn catch_run_reports_pass_for_true_command() {
     let repo = repo_with_rust();
     // Override the lint command to something deterministic.
