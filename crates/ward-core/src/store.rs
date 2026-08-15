@@ -60,6 +60,9 @@ pub struct Label {
     pub ts: i64,
 }
 
+/// One label-matrix row: (language, kind, verdict, count, avg_similarity).
+pub type LabelRow = (String, String, String, i64, f64);
+
 /// One daily trend snapshot (spec §9).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Snapshot {
@@ -466,7 +469,7 @@ impl Store {
     }
 
     /// Labels grouped by (language, kind, verdict) for calibration reports.
-    pub fn label_matrix(&self) -> Result<Vec<(String, String, String, i64, f64)>> {
+    pub fn label_matrix(&self) -> Result<Vec<LabelRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT COALESCE(language,'?'), COALESCE(kind,'?'), verdict,
                     COUNT(*), COALESCE(AVG(similarity),0)
