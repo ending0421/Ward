@@ -60,6 +60,11 @@ ward spot --repo . \
 ward action <advisory_id> accepted   # 或 ignored / dismissed
 ```
 
+**Agent 写文件后自动查重（PostToolUse hook）**：`--project` 安装时已配置。
+hook 会对比写入前后索引，对**新增/变更符号**逐个跑结构查重，把 ≥0.92 的
+强命中以 additionalContext 注入 Agent 上下文（≥0.92 时提示"优先复用"）。
+手动触发同款检查：`ward spot-file --repo . --path src/x.rs`。
+
 **提交前验证**：
 
 ```bash
@@ -84,9 +89,12 @@ ward intent-check --repo . --requirement "实现防抖" # 需求 vs diff 软性�
 assertions:
   - kind: no_new_dependency
   - kind: api_compat
-  - kind: must_pass, suite: "tests/utils/**"
-  - kind: behavior_diff, suite: "tests/golden/**"
-  - kind: max_files_changed, value: 6
+  - kind: must_pass
+    suite: "tests/utils/**"
+  - kind: behavior_diff
+    suite: "tests/golden/**"
+  - kind: max_files_changed
+    value: 6
 ```
 
 - 每个 commit message 引用条款号：`fix debounce edge case [spec:a2]`；
@@ -125,6 +133,14 @@ hooks（`--project` 安装时已配）：PreToolUse 大改动 deny-with-reason�
 
 - 阈值 0.92/0.80 是**初始值**；每周从 `advisories` 表抽样人工标注（黄金集），precision <60% 或误报 >20% 就调；
 - `ward action` 的回写率掉下来 → 阈值失真 → 全指标失真，这是单点风险；
+- **双标一致性护栏（spec §8）**：两个标注者各自对同一批 match 打标，
+  `ward stats` 输出 Fleiss κ；κ < 0.4 说明标注标准在漂移，先对齐标准再校准：
+  ```bash
+  ward label next --annotator alice --repo .      # alice 的待标队列
+  ward label set <advisory> <match> y --annotator alice
+  ward label next --annotator bob --repo .        # bob 的独立队列
+  ward stats --repo .                             # 看"标注一致性"行
+  ```
 - 每季度复核 `ward clusters` 趋势与 spec 衰减（`contract_runs` 纵向分析）。
 
 ## 7. 反模式清单（别这么用）
@@ -140,7 +156,11 @@ hooks（`--project` 安装时已配）：PreToolUse 大改动 deny-with-reason�
 ## 8. 快速参考
 
 ```bash
-ward init|index|spot|replay|catch-run|verify|form-check|compat-check|intent-check|card|clusters|action --help
+# 核心：init index spot spot-file replay catch-run verify form-check compat-check
+#        intent-check card clusters action
+# 治理：infer setup-hooks label calibrate snapshot stats
+# 运维：daemon service doctor report issue
+ward <子命令> --help
 ```
 
 - 配置：`.ward/config.toml`（thresholds / top_k / suppress / languages / lint / sandbox）

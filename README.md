@@ -254,6 +254,7 @@ crates/
                # snapshot/stats/daemon/service/doctor/report/issue/setup-hooks/
                # intent-check/card/clusters/action)
   ward-mcp/    # MCP daemon (stdio, 10 tools, official Rust SDK)
+  ward-bench/  # F11 scale benchmark: synthetic-repo gen + timed engine runs
 hooks/         # Claude Code PreToolUse/PostToolUse scripts
 examples/      # example spec + Claude Code settings
 specs/         # active task specs (form-check gate input)
@@ -338,6 +339,9 @@ cargo test --workspace
 cargo llvm-cov --workspace --summary-only   # coverage (cargo-llvm-cov, needs
                                             # llvm-tools-preview; CI gate ≥85% lines)
 scripts/verify-meaningful.sh $(command -v ward)   # 11-check meaningfulness harness
+cargo run --release -p ward-bench -- gen --symbols 10000   # F11 scale benchmark
+cargo run --release -p ward-bench -- run --repo /tmp/ward-bench-repo
+# numbers & thresholds: docs/BENCHMARKS.md
 ```
 
 Dogfood discipline (see [AGENTS.md](AGENTS.md)): new functions go through
