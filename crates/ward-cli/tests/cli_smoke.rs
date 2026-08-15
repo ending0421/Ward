@@ -187,6 +187,38 @@ fn card_clusters_replay_and_intent_roundtrip() {
 }
 
 #[test]
+fn form_check_ci_posture_is_fail_closed() {
+    let repo = repo_with_rust();
+    std::fs::create_dir_all(repo.path().join("specs")).unwrap();
+    std::fs::write(
+        repo.path().join("specs/task.md"),
+        "```yaml\nassertions:\n  - kind: no_new_dependency\n```\n",
+    )
+    .unwrap();
+    // Add a dependency change → no_new_dependency fails.
+    std::fs::write(repo.path().join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
+    let git = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo.path())
+        .args(["add", "-A"])
+        .output()
+        .unwrap();
+    assert!(git.status.success());
+    let git = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo.path())
+        .args(["commit", "-q", "-m", "c2"])
+        .output()
+        .unwrap();
+    assert!(git.status.success());
+    let out = ward(&["form-check", "--repo", ".", "--spec", "specs/task.md", "--ci"], repo.path());
+    assert_eq!(out.status.code(), Some(1), "--ci must exit 1 on fail: {}", String::from_utf8_lossy(&out.stderr));
+    // Advisory mode (no --ci) must not exit nonzero.
+    let out = ward(&["form-check", "--repo", ".", "--spec", "specs/task.md"], repo.path());
+    assert!(out.status.success(), "advisory mode stays fail-open");
+}
+
+#[test]
 fn catch_run_reports_pass_for_true_command() {
     let repo = repo_with_rust();
     // Override the lint command to something deterministic.
