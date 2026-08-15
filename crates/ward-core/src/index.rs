@@ -348,10 +348,16 @@ impl Indexer<'_> {
                 symbols.push(sym);
             }
             let ids = self.store.replace_file(&rel, &symbols)?;
-            for (id, e) in ids.iter().zip(&extracted) {
-                if !e.mentions.is_empty() {
-                    self.store.set_mentions(*id, &e.mentions)?;
-                }
+            let mention_rows: Vec<(i64, Vec<String>)> = ids
+                .iter()
+                .zip(&extracted)
+                .filter(|(_, e)| !e.mentions.is_empty())
+                .map(|(id, e)| (*id, e.mentions.clone()))
+                .collect();
+            if !mention_rows.is_empty() {
+                // One transaction for the whole file: per-symbol commits
+                // were 93% of full-index time at 10⁵ symbols (F11).
+                self.store.set_mentions_batch(&mention_rows)?;
             }
 
             let mut blocks = extract_blocks(&tree, &source);

@@ -267,7 +267,7 @@ pub fn spot(
     language: Option<Language>,
 ) -> Result<SpotResult> {
     let symbols = store.all_symbols()?;
-    let bm25 = Bm25::build(&symbols);
+    let bm25 = store.bm25()?;
 
     let mut query = tokenize(intent);
     if let Some(sig) = proposed_signature {
@@ -294,11 +294,17 @@ pub fn spot(
         .and_then(|(lang, t)| fingerprint::signature_simhash(t, lang.spec()));
 
     if let Some(qs) = &query_struct {
+        // Cap at top_k BEFORE materializing: each push reads the hit file
+        // for its line range, and a big L1 cluster (literal-variant family)
+        // would otherwise blow both latency and the advisory size (F11).
         for sym in symbols
             .iter()
             .filter(|s| &s.struct_hash == qs)
             .filter(|s| !config.is_suppressed(&s.file_path))
         {
+            if matches.len() >= config.top_k {
+                break;
+            }
             matches.push(SpotMatch {
                 path: sym.file_path.clone(),
                 lines: line_range(&repo.join(&sym.file_path), sym.start_byte, sym.end_byte),

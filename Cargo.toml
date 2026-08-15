@@ -4,6 +4,7 @@ members = [
     "crates/ward-core",
     "crates/ward-cli",
     "crates/ward-mcp",
+    "crates/ward-bench",
 ]
 
 [workspace.package]
