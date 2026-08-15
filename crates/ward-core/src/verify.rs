@@ -502,7 +502,10 @@ mod tests {
         // after exit deadlocks the child in write() once the buffer fills,
         // turning a pass into a bogus timeout.
         let mut cmd = Command::new("sh");
-        cmd.args(["-c", "yes '0123456789012345678901234567890123456789' | head -c 1048576"]);
+        cmd.args([
+            "-c",
+            "yes '0123456789012345678901234567890123456789' | head -c 1048576",
+        ]);
         let (ok, stdout, stderr) = run_with_timeout(&mut cmd, Duration::from_secs(15));
         assert!(ok, "expected a real pass, stderr: {stderr}");
         assert!(stderr.is_empty(), "stderr: {stderr}");
