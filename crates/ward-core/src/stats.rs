@@ -60,6 +60,8 @@ pub struct GovReport {
     pub stability: String,
     pub current: CurrentStats,
     pub series: Vec<Series>,
+    /// Inter-annotator agreement over the golden set (spec §8 标注腐烂护栏).
+    pub agreement: crate::label::AgreementReport,
 }
 
 fn rate(ok: i64, total: i64) -> Option<f64> {
@@ -181,6 +183,7 @@ pub fn stats(repo: &Path, store: &Store, config: &WardConfig) -> Result<GovRepor
             decay_hint,
         },
         series,
+        agreement: crate::label::annotator_agreement(store)?,
     })
 }
 
@@ -191,13 +194,18 @@ pub fn render_table(report: &GovReport) -> String {
         .divergence
         .map(|d| format!("{d:.2}"))
         .unwrap_or_else(|| "-".into());
-    format!(
+    let kappa = report
+        .agreement
+        .fleiss_kappa
+        .map(|k| format!("{k:+.2}"))
+        .unwrap_or_else(|| "-".into());
+    let mut out = format!(
         "Ward 治理报表 {}\n\
          采纳（推断通道）: {}/{} = {:.0}% | 拒绝: {}\n\
          采纳（自报通道）: {}/{} = {:.0}% | 背离: {}\n\
          符号: {} | 重复簇: {} | 黄金集标注: {}\n\
          断言执行: {} | 通过率: {} | 衰减提示: {}\n\
-         快照点数: {}（系列见 --json）",
+         标注一致性: 双标 match {} 个 | Fleiss κ = {} | {}",
         report.repo,
         a.inferred_accepted,
         a.inferred_total,
@@ -221,8 +229,26 @@ pub fn render_table(report: &GovReport) -> String {
             .decay_hint
             .map(|d| format!("{:+.2}", d))
             .unwrap_or_else(|| "-".into()),
+        report.agreement.double_labeled,
+        kappa,
+        report
+            .agreement
+            .per_annotator
+            .iter()
+            .map(|(n, c)| format!("{n}={c}"))
+            .collect::<Vec<_>>()
+            .join(", "),
+    );
+    if let Some(k) = report.agreement.fleiss_kappa {
+        if k < 0.4 {
+            out.push_str("\n  ⚠ 标注一致率低（Fleiss κ < 0.4）：阈值校准失真风险（spec §8 标注腐烂护栏），请交叉抽检标注流程");
+        }
+    }
+    out.push_str(&format!(
+        "\n 快照点数: {}（系列见 --json）",
         report.series.first().map(|s| s.points.len()).unwrap_or(0),
-    )
+    ));
+    out
 }
 
 #[cfg(test)]
@@ -252,6 +278,7 @@ mod tests {
                     id: None,
                     advisory_id: format!("a{i}"),
                     match_index: 0,
+                    annotator: "human".into(),
                     query_hash: None,
                     language: None,
                     kind: Some("near".into()),

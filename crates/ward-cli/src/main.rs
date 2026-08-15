@@ -49,6 +49,9 @@ enum LabelAction {
         json: bool,
         #[arg(default_value = ".", long)]
         repo: PathBuf,
+        /// Annotator name (double-annotation: the queue is per-annotator)
+        #[arg(long, default_value = "human")]
+        annotator: String,
     },
     /// Record a verdict: y (relevant) or n (not relevant)
     Set {
@@ -58,6 +61,9 @@ enum LabelAction {
         verdict: String,
         #[arg(default_value = ".", long)]
         repo: PathBuf,
+        /// Annotator name (double-annotation, spec §8)
+        #[arg(long, default_value = "human")]
+        annotator: String,
     },
 }
 
@@ -85,6 +91,18 @@ enum Cmd {
         /// auto-detected from the snippet when omitted.
         #[arg(long, value_name = "LANG")]
         language: Option<String>,
+        #[arg(default_value = ".", long)]
+        repo: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Spot-check the symbols one file just introduced/changed (PostToolUse
+    /// hook engine): diff working tree vs the pre-write index, then run a
+    /// structural spot query per new/changed symbol (cap 5).
+    SpotFile {
+        /// Repo-relative source path that was just written.
+        #[arg(long)]
+        path: String,
         #[arg(default_value = ".", long)]
         repo: PathBuf,
         #[arg(long)]
@@ -385,6 +403,38 @@ fn main() -> Result<()> {
                 }
             }
         }
+        Cmd::SpotFile { path, repo, json } => {
+            let cfg = load_config(&repo);
+            let store = open_store(&repo)?;
+            let report = ward_core::spotfile::spot_new_symbols(&repo, &store, &cfg, &path)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!(
+                    "spot-file {}: {} new/changed, {} checked",
+                    report.path,
+                    report.changed_symbols.len(),
+                    report.checked
+                );
+                for (i, advisory) in report.advisories.iter().enumerate() {
+                    let name = report
+                        .changed_symbols
+                        .get(i)
+                        .map(String::as_str)
+                        .unwrap_or("?");
+                    if advisory.matches.is_empty() {
+                        println!("  {name}: (no matches above threshold)");
+                        continue;
+                    }
+                    for m in &advisory.matches {
+                        println!(
+                            "  {name} → [{} {:0.2}] {}:{} ({}) — {}",
+                            m.kind, m.similarity, m.path, m.lines, m.symbol, m.note
+                        );
+                    }
+                }
+            }
+        }
         Cmd::Replay {
             base,
             head,
@@ -559,13 +609,18 @@ fn main() -> Result<()> {
             }
         }
         Cmd::Label { action } => match action {
-            LabelAction::Next { count, json, repo } => {
+            LabelAction::Next {
+                count,
+                json,
+                repo,
+                annotator,
+            } => {
                 let store = open_store(&repo)?;
-                let cands = ward_core::label::candidates(&store, &repo, count)?;
+                let cands = ward_core::label::candidates_by(&store, &repo, count, &annotator)?;
                 if json {
                     println!("{}", serde_json::to_string_pretty(&cands)?);
                 } else if cands.is_empty() {
-                    println!("没有未标注的 match。跑几次 spot 后再来。");
+                    println!("没有未标注的 match（标注者 {annotator}）。跑几次 spot 后再来。");
                 } else {
                     for c in cands {
                         println!(
@@ -581,7 +636,7 @@ fn main() -> Result<()> {
                             c.snippet.as_deref().unwrap_or("(snippet unavailable)")
                         );
                         println!(
-                            "  标注: ward label set {} {} y|n",
+                            "  标注: ward label set {} {} y|n --annotator {annotator}",
                             c.advisory_id, c.match_index
                         );
                         println!();
@@ -593,10 +648,17 @@ fn main() -> Result<()> {
                 match_index,
                 verdict,
                 repo,
+                annotator,
             } => {
                 let store = open_store(&repo)?;
-                ward_core::label::label_match(&store, &advisory_id, match_index, &verdict)?;
-                println!("labeled {advisory_id}#{match_index} = {verdict}");
+                ward_core::label::label_match_by(
+                    &store,
+                    &advisory_id,
+                    match_index,
+                    &verdict,
+                    &annotator,
+                )?;
+                println!("labeled {advisory_id}#{match_index} = {verdict} ({annotator})");
             }
         },
         Cmd::Calibrate { repo, json } => {

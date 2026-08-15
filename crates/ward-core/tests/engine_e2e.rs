@@ -300,6 +300,53 @@ fn incremental_indexing_skips_unchanged_files() {
 }
 
 #[test]
+fn spot_file_checks_new_symbols_against_the_store() {
+    let repo = TestRepo::new();
+    repo.write(
+        "src/lib.rs",
+        "pub fn debounce(f: &dyn Fn(u64), ms: u64) -> u8 { f(ms); 0 }",
+    );
+    repo.commit_all("c1");
+    index::index_repo(repo.path(), &cfg()).unwrap();
+    let store = Store::open(&Store::default_path(repo.path())).unwrap();
+
+    // The hook runs BEFORE the index refresh: the store still holds the
+    // pre-write state, the working tree holds the new file.
+    repo.write(
+        "src/new.rs",
+        "pub fn debounce2(f: &dyn Fn(u64), ms: u64) -> u8 { f(ms); 0 }\npub fn unrelated() -> u8 { 7 }\n",
+    );
+    let report =
+        ward_core::spotfile::spot_new_symbols(repo.path(), &store, &cfg(), "src/new.rs").unwrap();
+    assert_eq!(
+        report.changed_symbols,
+        vec!["debounce2".to_string(), "unrelated".to_string()],
+        "both symbols are new to the pre-write store"
+    );
+    assert_eq!(report.checked, 2);
+    let debounce_adv = &report.advisories[0];
+    assert!(
+        debounce_adv
+            .matches
+            .iter()
+            .any(|m| m.symbol == "debounce" && m.similarity >= 0.9),
+        "the exact clone must be recalled structurally: {:?}",
+        debounce_adv.matches
+    );
+
+    // Re-check after indexing: the symbols are now known → nothing changed.
+    index::index_repo(repo.path(), &cfg()).unwrap();
+    let store2 = Store::open(&Store::default_path(repo.path())).unwrap();
+    let again =
+        ward_core::spotfile::spot_new_symbols(repo.path(), &store2, &cfg(), "src/new.rs").unwrap();
+    assert!(
+        again.changed_symbols.is_empty(),
+        "unchanged file ⇒ no changed symbols: {:?}",
+        again.changed_symbols
+    );
+}
+
+#[test]
 fn index_repo_records_freshness_and_sha() {
     let repo = TestRepo::new();
     repo.write("lib.rs", "pub fn f() {}");
@@ -1025,6 +1072,7 @@ fn schema_rebuild_preserves_governance_data() {
                 id: None,
                 advisory_id: "adv_keep".into(),
                 match_index: 0,
+                annotator: "human".into(),
                 query_hash: None,
                 language: None,
                 kind: Some("near".into()),

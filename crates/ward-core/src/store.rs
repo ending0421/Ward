@@ -10,7 +10,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 /// Current schema version. Bump on any schema change; mismatches trigger a
 /// full rebuild instead of a migration (rebuild is cheap and always safe).
-pub const SCHEMA_VERSION: i64 = 5;
+pub const SCHEMA_VERSION: i64 = 6;
 
 /// One indexed symbol (function / struct / enum / trait / method, …).
 #[derive(Debug, Clone, PartialEq)]
@@ -55,6 +55,8 @@ pub struct Label {
     pub id: Option<i64>,
     pub advisory_id: String,
     pub match_index: i64,
+    /// Who gave this verdict (double-annotation agreement, spec §8).
+    pub annotator: String,
     pub query_hash: Option<String>,
     pub language: Option<String>,
     pub kind: Option<String>,
@@ -116,6 +118,12 @@ pub struct ContractRun {
 /// Open handle to the Ward index database.
 pub struct Store {
     conn: Connection,
+    /// In-process BM25 cache: built once per symbol generation and dropped
+    /// whenever the symbol table is rewritten (`replace_file`). The daemon
+    /// and the PostToolUse hook run many spot queries per process —
+    /// rebuilding the index per query is O(N·tokens) and dominates latency
+    /// at 10⁴+ symbols (F11, spot P99 <100ms).
+    bm25: std::cell::RefCell<Option<std::rc::Rc<crate::search::Bm25>>>,
 }
 
 fn create_schema(conn: &Connection) -> Result<()> {
@@ -161,6 +169,8 @@ fn create_schema(conn: &Connection) -> Result<()> {
             kind             TEXT,
             commit_sha       TEXT NOT NULL
         );
+        -- replace_blocks deletes per file_path — index it (F11).
+        CREATE INDEX IF NOT EXISTS idx_blocks_file ON blocks(file_path);
 
         -- spec §4: dependency edges (static, lower-bound estimate)
         CREATE TABLE IF NOT EXISTS edges (
@@ -178,6 +188,9 @@ fn create_schema(conn: &Connection) -> Result<()> {
             name      TEXT NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_mentions_name ON mentions(name);
+        -- The per-symbol DELETE walks this index; without it, index_all
+        -- degrades to O(N²) at scale (F11 benchmark: 10⁵ symbols ≈ 9.5min).
+        CREATE INDEX IF NOT EXISTS idx_mentions_symbol ON mentions(symbol_id);
 
         -- spec §4: advisory feedback loop
         CREATE TABLE IF NOT EXISTS advisories (
@@ -203,11 +216,13 @@ fn create_schema(conn: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_contract_runs_spec ON contract_runs(spec_path);
 
         -- Golden-set labels (spec §9): match-level human verdicts feeding
-        -- threshold calibration.
+        -- threshold calibration. `annotator` (v6) enables double-annotation
+        -- agreement measurement (spec §8 标注腐烂护栏).
         CREATE TABLE IF NOT EXISTS labels (
             id          INTEGER PRIMARY KEY,
             advisory_id TEXT NOT NULL,
             match_index INTEGER NOT NULL,
+            annotator   TEXT NOT NULL DEFAULT 'human',
             query_hash  TEXT,
             language    TEXT,
             kind        TEXT,
@@ -217,6 +232,7 @@ fn create_schema(conn: &Connection) -> Result<()> {
         );
         CREATE INDEX IF NOT EXISTS idx_labels_verdict ON labels(verdict);
         CREATE INDEX IF NOT EXISTS idx_labels_lang ON labels(language);
+        CREATE INDEX IF NOT EXISTS idx_labels_match ON labels(advisory_id, match_index);
 
         -- Trend snapshots (spec §9): one row per day, idempotent.
         CREATE TABLE IF NOT EXISTS snapshots (
@@ -282,7 +298,10 @@ impl Store {
             tracing::warn!("index integrity check failed ({integrity}); rebuilding (F1)");
             Self::reset(&conn)?;
         }
-        Ok(Store { conn })
+        Ok(Store {
+            conn,
+            bm25: std::cell::RefCell::new(None),
+        })
     }
 
     /// Drop every table and recreate the schema, then stamp the version.
@@ -313,9 +332,22 @@ impl Store {
              DROP TABLE IF EXISTS meta;",
         )?;
         create_schema(conn)?;
+        // labels gained `annotator` in schema v6: copy column-explicit so a
+        // v5 backup lands with the default annotator. The other governance
+        // tables keep the `SELECT *` copy (additive-only policy).
         for table in GOVERNANCE {
-            // Column sets are stable across schema bumps for governance
-            // tables (additive-only policy documented on the struct).
+            if *table == "labels" {
+                conn.execute_batch(
+                    "INSERT INTO labels
+                       (advisory_id, match_index, annotator, query_hash,
+                        language, kind, similarity, verdict, ts)
+                     SELECT advisory_id, match_index, 'human', query_hash,
+                            language, kind, similarity, verdict, ts
+                     FROM ward_bak_labels;
+                     DROP TABLE ward_bak_labels;",
+                )?;
+                continue;
+            }
             conn.execute_batch(&format!(
                 "INSERT INTO {table} SELECT * FROM ward_bak_{table};
                  DROP TABLE ward_bak_{table};"
@@ -340,6 +372,9 @@ impl Store {
     /// Returns the inserted row ids in insertion order (used to attach
     /// per-symbol mention edges).
     pub fn replace_file(&mut self, file_path: &str, symbols: &[Symbol]) -> Result<Vec<i64>> {
+        // The BM25 recall index is derived from the symbol table — drop it,
+        // the next query rebuilds it against this state.
+        *self.bm25.borrow_mut() = None;
         let tx = self.conn.transaction()?;
         tx.execute(
             "DELETE FROM symbols WHERE file_path = ?1",
@@ -375,16 +410,25 @@ impl Store {
 
     /// Record identifier mentions for one symbol (static edge lower bound).
     pub fn set_mentions(&mut self, symbol_id: i64, names: &[String]) -> Result<()> {
+        self.set_mentions_batch(&[(symbol_id, names.to_vec())])
+    }
+
+    /// Replace mention edges for many symbols in ONE transaction. Calling
+    /// [`set_mentions`] per symbol commits (and fsyncs) once per symbol —
+    /// that was 93% of full-index time at 10⁵ symbols (F11 benchmark).
+    pub fn set_mentions_batch(&mut self, rows: &[(i64, Vec<String>)]) -> Result<()> {
         let tx = self.conn.transaction()?;
-        tx.execute(
-            "DELETE FROM mentions WHERE symbol_id = ?1",
-            params![symbol_id],
-        )?;
-        for n in names {
+        for (symbol_id, names) in rows {
             tx.execute(
-                "INSERT INTO mentions (symbol_id, name) VALUES (?1, ?2)",
-                params![symbol_id, n],
+                "DELETE FROM mentions WHERE symbol_id = ?1",
+                params![symbol_id],
             )?;
+            for n in names {
+                tx.execute(
+                    "INSERT INTO mentions (symbol_id, name) VALUES (?1, ?2)",
+                    params![symbol_id, n],
+                )?;
+            }
         }
         tx.commit()?;
         Ok(())
@@ -484,13 +528,27 @@ impl Store {
 
     // ---- golden-set labels (spec §9) --------------------------------------
 
+    /// The BM25 recall index over the current symbol table, cached per
+    /// store instance (invalidated by `replace_file`). The daemon and the
+    /// PostToolUse hook amortize one build across many spot queries —
+    /// building per query dominates spot latency at 10⁴+ symbols (F11).
+    pub fn bm25(&self) -> Result<std::rc::Rc<crate::search::Bm25>> {
+        let mut cache = self.bm25.borrow_mut();
+        if cache.is_none() {
+            let symbols = self.all_symbols()?;
+            *cache = Some(std::rc::Rc::new(crate::search::Bm25::build(&symbols)));
+        }
+        Ok(cache.as_ref().expect("built above").clone())
+    }
+
     pub fn record_label(&self, l: &Label) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO labels (advisory_id, match_index, query_hash, language, kind, similarity, verdict, ts)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+            "INSERT INTO labels (advisory_id, match_index, annotator, query_hash, language, kind, similarity, verdict, ts)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
             params![
                 l.advisory_id,
                 l.match_index,
+                l.annotator,
                 l.query_hash,
                 l.language,
                 l.kind,
@@ -508,14 +566,36 @@ impl Store {
             .query_row("SELECT COUNT(*) FROM labels", [], |r| r.get(0))?)
     }
 
-    /// All labels as (similarity, verdict) — calibration input. Labels
-    /// without a stored similarity are excluded (they cannot be bucketed).
+    /// Calibration input: one (similarity, verdict) per match. With
+    /// double-annotation the primary annotator's verdict wins when present
+    /// (`human`), otherwise the earliest — calibration must not double-count
+    /// a match, agreement is reported separately.
     pub fn labels_with_similarity(&self) -> Result<Vec<(f64, String)>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT similarity, verdict FROM labels WHERE similarity IS NOT NULL")?;
-        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+        let mut stmt = self.conn.prepare(
+            "SELECT advisory_id, match_index, similarity, verdict, annotator, ts
+             FROM labels WHERE similarity IS NOT NULL ORDER BY ts ASC",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, f64>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, String>(4)?,
+            ))
+        })?;
+        // Prefer the 'human' verdict for a match; fall back to earliest.
+        let mut by_match: std::collections::BTreeMap<(String, i64), (f64, String)> =
+            std::collections::BTreeMap::new();
+        for row in rows {
+            let (advisory, idx, sim, verdict, annotator) = row?;
+            let key = (advisory, idx);
+            let entry = by_match.entry(key).or_insert((sim, verdict.clone()));
+            if annotator == "human" {
+                *entry = (sim, verdict);
+            }
+        }
+        Ok(by_match.into_values().collect())
     }
 
     /// Labels grouped by (language, kind, verdict) for calibration reports.
@@ -531,7 +611,8 @@ impl Store {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
-    /// True when this (advisory_id, match_index) is already labeled.
+    /// True when this (advisory_id, match_index) is already labeled by ANY
+    /// annotator.
     pub fn is_labeled(&self, advisory_id: &str, match_index: i64) -> Result<bool> {
         let n: i64 = self.conn.query_row(
             "SELECT COUNT(*) FROM labels WHERE advisory_id = ?1 AND match_index = ?2",
@@ -539,6 +620,48 @@ impl Store {
             |r| r.get(0),
         )?;
         Ok(n > 0)
+    }
+
+    /// True when the given annotator has already labeled this match
+    /// (double-annotation: `label next --annotator alice` only shows matches
+    /// alice has not seen).
+    pub fn is_labeled_by(
+        &self,
+        advisory_id: &str,
+        match_index: i64,
+        annotator: &str,
+    ) -> Result<bool> {
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM labels
+             WHERE advisory_id = ?1 AND match_index = ?2 AND annotator = ?3",
+            params![advisory_id, match_index, annotator],
+            |r| r.get(0),
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Every label row — the raw input for the inter-annotator agreement
+    /// report (spec §8 标注腐烂护栏).
+    pub fn labels_all(&self) -> Result<Vec<Label>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, advisory_id, match_index, annotator, query_hash, language, kind, similarity, verdict, ts
+             FROM labels ORDER BY advisory_id ASC, match_index ASC, ts ASC",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(Label {
+                id: r.get(0)?,
+                advisory_id: r.get(1)?,
+                match_index: r.get(2)?,
+                annotator: r.get(3)?,
+                query_hash: r.get(4)?,
+                language: r.get(5)?,
+                kind: r.get(6)?,
+                similarity: r.get(7)?,
+                verdict: r.get(8)?,
+                ts: r.get(9)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
     // ---- snapshots (spec §9) ----------------------------------------------
@@ -765,7 +888,7 @@ impl Store {
     /// Labels for one advisory, ordered by match index.
     pub fn labels_for_advisory(&self, advisory_id: &str) -> Result<Vec<Label>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, advisory_id, match_index, query_hash, language, kind, similarity, verdict, ts
+            "SELECT id, advisory_id, match_index, annotator, query_hash, language, kind, similarity, verdict, ts
              FROM labels WHERE advisory_id = ?1 ORDER BY match_index ASC",
         )?;
         let rows = stmt.query_map(params![advisory_id], |r| {
@@ -773,12 +896,13 @@ impl Store {
                 id: r.get(0)?,
                 advisory_id: r.get(1)?,
                 match_index: r.get(2)?,
-                query_hash: r.get(3)?,
-                language: r.get(4)?,
-                kind: r.get(5)?,
-                similarity: r.get(6)?,
-                verdict: r.get(7)?,
-                ts: r.get(8)?,
+                annotator: r.get(3)?,
+                query_hash: r.get(4)?,
+                language: r.get(5)?,
+                kind: r.get(6)?,
+                similarity: r.get(7)?,
+                verdict: r.get(8)?,
+                ts: r.get(9)?,
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
@@ -1047,6 +1171,50 @@ mod tests {
         // The row was replaced (INSERT OR REPLACE): the action update still
         // resolves to exactly one row.
         store.set_agent_action("adv_1", "ignored").unwrap();
+    }
+
+    #[test]
+    fn v5_labels_migrate_to_v6_with_default_annotator() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("index.db");
+        {
+            // Hand-build a v5-shaped database: schema_version 5 and the four
+            // governance tables in their v5 column sets (labels has no
+            // annotator yet), with one golden label inside.
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT);
+                 INSERT INTO meta VALUES ('schema_version','5');
+                 CREATE TABLE advisories (id TEXT PRIMARY KEY, tool TEXT, ts INTEGER,
+                                          query_hash TEXT, result_json TEXT,
+                                          agent_action TEXT, inferred_action TEXT,
+                                          inferred_commit_sha TEXT);
+                 CREATE TABLE labels (
+                     id INTEGER PRIMARY KEY, advisory_id TEXT NOT NULL,
+                     match_index INTEGER NOT NULL, query_hash TEXT, language TEXT,
+                     kind TEXT, similarity REAL, verdict TEXT NOT NULL, ts INTEGER NOT NULL);
+                 INSERT INTO labels (advisory_id, match_index, verdict, ts)
+                 VALUES ('adv_1', 0, 'y', 1);
+                 CREATE TABLE snapshots (ts INTEGER PRIMARY KEY, symbols INTEGER,
+                                         clusters INTEGER, advisories INTEGER,
+                                         labels INTEGER, contract_runs INTEGER,
+                                         contract_pass INTEGER);
+                 CREATE TABLE contract_runs (spec_path TEXT, commit_sha TEXT,
+                                             ts INTEGER, assertion TEXT,
+                                             verdict TEXT, detail TEXT);",
+            )
+            .unwrap();
+        }
+        // Opening with the v6 code bumps the schema: the rebuild must carry
+        // the golden label across with annotator='human' (F1 rebuild loses
+        // speed, never truth).
+        let store = Store::open(&db).unwrap();
+        let all = store.labels_all().unwrap();
+        assert_eq!(all.len(), 1, "v5 label must survive the rebuild: {all:?}");
+        assert_eq!(all[0].annotator, "human");
+        assert_eq!(all[0].verdict, "y");
+        assert!(store.is_labeled_by("adv_1", 0, "human").unwrap());
+        assert!(!store.is_labeled_by("adv_1", 0, "alice").unwrap());
     }
 
     #[test]

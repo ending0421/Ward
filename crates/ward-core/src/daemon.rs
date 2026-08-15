@@ -189,6 +189,7 @@ mod tests {
                 id: None,
                 advisory_id: "a".into(),
                 match_index: 0,
+                annotator: "human".into(),
                 query_hash: None,
                 language: None,
                 kind: Some("near".into()),
