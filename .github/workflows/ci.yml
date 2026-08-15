@@ -45,10 +45,13 @@ jobs:
         with:
           fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@nightly
       - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-semver-checks (api_compat tool, spec §3-M4)
+        run: cargo install cargo-semver-checks --locked
       - name: Build ward
         run: cargo build --release -p ward-cli
-      - name: Form-check the active task spec (fail-closed)
+      - name: Form-check the active task spec (fail-closed; api_compat adjudicated here)
         run: ./target/release/ward form-check --repo . --spec specs/2026-08-gov-data.md --ci
 
   meaningful-smoke:

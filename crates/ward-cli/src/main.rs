@@ -471,7 +471,12 @@ fn main() -> Result<()> {
             let head =
                 ward_core::git::head_sha(&repo)?.unwrap_or_else(|| "uncommitted".to_string());
             let base = base.unwrap_or_else(|| "HEAD^".to_string());
-            let results = spec::evaluate(&repo, &parsed, &base, &head)?;
+            // Outer-loop posture: adjudicate api_compat with the real tool.
+            let results = if ci {
+                spec::evaluate_ci(&repo, &parsed, &base, &head)?
+            } else {
+                spec::evaluate(&repo, &parsed, &base, &head)?
+            };
             for r in &results {
                 store.record_contract_run(&ward_core::store::ContractRun {
                     spec_path: spec_path.to_string_lossy().into_owned(),

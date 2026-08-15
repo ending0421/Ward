@@ -195,8 +195,12 @@ fn form_check_ci_posture_is_fail_closed() {
         "```yaml\nassertions:\n  - kind: no_new_dependency\n```\n",
     )
     .unwrap();
-    // Add a dependency change → no_new_dependency fails.
-    std::fs::write(repo.path().join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
+    // Add a NEW dependency (serde) → no_new_dependency fails.
+    std::fs::write(
+        repo.path().join("Cargo.toml"),
+        "[package]\nname = \"x\"\n\n[dependencies]\nserde = \"1\"\n",
+    )
+    .unwrap();
     let git = std::process::Command::new("git")
         .arg("-C")
         .arg(repo.path())

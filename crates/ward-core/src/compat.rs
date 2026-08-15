@@ -42,22 +42,23 @@ pub struct CompatReport {
     pub duration_ms: u64,
 }
 
-fn read_all(child: std::process::Child) -> (String, String) {
-    let mut child = child;
-    use std::io::Read;
-    let mut out = String::new();
-    let mut err = String::new();
-    if let Some(mut o) = child.stdout.take() {
-        let _ = o.read_to_string(&mut out);
-    }
-    if let Some(mut e) = child.stderr.take() {
-        let _ = e.read_to_string(&mut err);
-    }
-    (out, err)
+fn read_pipe<R: std::io::Read + Send + 'static>(
+    pipe: Option<R>,
+) -> std::thread::JoinHandle<String> {
+    std::thread::spawn(move || {
+        let mut text = String::new();
+        if let Some(mut pipe) = pipe {
+            let _ = pipe.read_to_string(&mut text);
+        }
+        text
+    })
 }
 
 fn run(cmd: &mut Command, timeout: Duration) -> Result<std::process::Output, String> {
     let start = Instant::now();
+    // Drain both pipes on reader threads from spawn time: reading only after
+    // the child exits deadlocks once it fills the OS pipe buffer (~64KiB on
+    // macOS) — a real pass would be misreported as a timeout.
     let mut child = match cmd
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -66,13 +67,16 @@ fn run(cmd: &mut Command, timeout: Duration) -> Result<std::process::Output, Str
         Ok(c) => c,
         Err(e) => return Err(format!("spawn failed: {e}")),
     };
+    let out_pipe = read_pipe(child.stdout.take());
+    let err_pipe = read_pipe(child.stderr.take());
     let deadline = start + timeout;
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
-                // Drain pipes BEFORE assembling: on some platforms
-                // `wait_with_output` after an observed exit loses data.
-                let (out, err) = read_all(child);
+                // The child is gone: both write ends are closed, the readers
+                // hit EOF — joining cannot hang.
+                let out = out_pipe.join().unwrap_or_default();
+                let err = err_pipe.join().unwrap_or_default();
                 return Ok(std::process::Output {
                     status,
                     stdout: out.into_bytes(),
@@ -83,10 +87,16 @@ fn run(cmd: &mut Command, timeout: Duration) -> Result<std::process::Output, Str
                 if Instant::now() >= deadline {
                     let _ = child.kill();
                     let _ = child.wait();
+                    // kill+wait closes the write ends; join so the readers
+                    // never leak.
+                    let _ = out_pipe.join();
+                    let _ = err_pipe.join();
                     return Err("timeout".into());
                 }
                 std::thread::sleep(Duration::from_millis(50));
             }
+            // try_wait failing leaves the child's liveness unknown; joining
+            // here could hang on a live writer, so return without the pipes.
             Err(e) => return Err(format!("wait failed: {e}")),
         }
     }
@@ -248,5 +258,21 @@ mod tests {
         );
         assert_eq!(r.verdict, CompatVerdict::Fail);
         assert!(r.detail.contains("incompatible"), "detail: {}", r.detail);
+    }
+
+    #[test]
+    fn large_tool_output_is_not_a_timeout() {
+        // A tool emitting ~1MiB (far beyond the OS pipe buffer) and exiting
+        // 0 must be a pass, not a bogus timeout: the reader threads drain
+        // both pipes from spawn time.
+        let repo = rust_repo();
+        let loud =
+            shim("#!/bin/sh\nyes '0123456789012345678901234567890123456789' | head -c 1048576\n");
+        let r = run_compat(
+            loud.path().join("cargo").to_str().unwrap(),
+            repo.path(),
+            "HEAD^",
+        );
+        assert_eq!(r.verdict, CompatVerdict::Pass, "{}", r.detail);
     }
 }

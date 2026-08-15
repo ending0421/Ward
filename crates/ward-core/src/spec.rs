@@ -5,6 +5,7 @@
 //! needs the outer loop (`must_pass`, `behavior_diff`, `api_compat`) is
 //! honestly reported as `deferred` / `unknown` — never a fake green.
 
+use std::collections::BTreeSet;
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -161,12 +162,42 @@ pub fn evaluate(repo: &Path, spec: &Spec, base: &str, head: &str) -> Result<Vec<
     let changed = git::diff_names(repo, base, head).unwrap_or_default();
     let mut results = Vec::new();
     for a in &spec.assertions {
-        results.push(evaluate_one(&changed, a));
+        results.push(evaluate_one(repo, base, head, &changed, a));
     }
     Ok(results)
 }
 
-fn evaluate_one(changed: &[String], a: &Assertion) -> AssertionResult {
+/// Outer-loop evaluation (`form-check --ci`): assertions the inner loop can
+/// only mark `unknown` are adjudicated here with the real tooling — the
+/// outer loop never greenlights an `unknown` (P7).
+pub fn evaluate_ci(
+    repo: &Path,
+    spec: &Spec,
+    base: &str,
+    head: &str,
+) -> Result<Vec<AssertionResult>> {
+    let mut results = evaluate(repo, spec, base, head)?;
+    for r in &mut results {
+        if r.assertion == "api_compat" && r.verdict == Verdict::Unknown {
+            let report = crate::compat::api_compat_check(repo, base);
+            r.verdict = match report.verdict {
+                crate::compat::CompatVerdict::Pass => Verdict::Pass,
+                crate::compat::CompatVerdict::Fail => Verdict::Fail,
+                crate::compat::CompatVerdict::Unknown => Verdict::Unknown,
+            };
+            r.detail = format!("{} [{}]", report.detail, report.tool);
+        }
+    }
+    Ok(results)
+}
+
+fn evaluate_one(
+    repo: &Path,
+    base: &str,
+    head: &str,
+    changed: &[String],
+    a: &Assertion,
+) -> AssertionResult {
     match a.kind.as_str() {
         "no_new_dependency" => {
             let hits: Vec<&String> = changed
@@ -184,17 +215,7 @@ fn evaluate_one(changed: &[String], a: &Assertion) -> AssertionResult {
                     detail: "依赖清单无变更".to_string(),
                 }
             } else {
-                AssertionResult {
-                    assertion: a.kind.clone(),
-                    verdict: Verdict::Fail,
-                    detail: format!(
-                        "依赖清单变更：{}",
-                        hits.iter()
-                            .map(|s| s.as_str())
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    ),
-                }
+                dependency_verdict(repo, base, head, &hits)
             }
         }
         "max_files_changed" => match a.value {
@@ -236,6 +257,92 @@ fn evaluate_one(changed: &[String], a: &Assertion) -> AssertionResult {
             detail: format!("未知断言种类 {other}（fail-open）"),
         },
     }
+}
+
+/// Adjudicate `no_new_dependency` for changed manifests: compare the
+/// *dependency set* between base and head. A version bump or metadata edit
+/// is not a new dependency; an added dependency key (Cargo.toml) or package
+/// name (Cargo.lock) is. Unreadable/unparseable sides are `unknown`, never
+/// a fake pass.
+fn dependency_verdict(repo: &Path, base: &str, _head: &str, hits: &[&String]) -> AssertionResult {
+    let mut added: Vec<String> = Vec::new();
+    let mut unreadable: Vec<&str> = Vec::new();
+    for path in hits {
+        let is_lock = path.ends_with("Cargo.lock");
+        let base_raw = git::show_file(repo, base, path).ok().flatten();
+        let head_raw = std::fs::read_to_string(repo.join(path)).ok();
+        match head_raw
+            .as_deref()
+            .and_then(|h| new_deps(base_raw.as_deref(), h, is_lock).ok())
+        {
+            Some(mut deps) => added.append(&mut deps),
+            None => unreadable.push(path),
+        }
+    }
+    if !unreadable.is_empty() {
+        return AssertionResult {
+            assertion: "no_new_dependency".into(),
+            verdict: Verdict::Unknown,
+            detail: format!("依赖清单有改动但无法比对：{}", unreadable.join(", ")),
+        };
+    }
+    if added.is_empty() {
+        AssertionResult {
+            assertion: "no_new_dependency".into(),
+            verdict: Verdict::Pass,
+            detail: "依赖清单有改动，无新增依赖（版本/元数据变更）".into(),
+        }
+    } else {
+        added.sort();
+        added.dedup();
+        AssertionResult {
+            assertion: "no_new_dependency".into(),
+            verdict: Verdict::Fail,
+            detail: format!("新增依赖：{}", added.join(", ")),
+        }
+    }
+}
+
+/// Dependency names present in one manifest content. `Err` when the TOML
+/// does not parse (the caller turns that into `unknown`).
+fn dep_names(raw: &str, is_lock: bool) -> Result<BTreeSet<String>, String> {
+    let value: toml::Value = toml::from_str(raw).map_err(|e| format!("parse: {e}"))?;
+    let mut out = BTreeSet::new();
+    if is_lock {
+        if let Some(pkgs) = value.get("package").and_then(|p| p.as_array()) {
+            for p in pkgs {
+                if let Some(name) = p.get("name").and_then(|n| n.as_str()) {
+                    out.insert(name.to_string());
+                }
+            }
+        }
+        return Ok(out);
+    }
+    for table in ["dependencies", "dev-dependencies", "build-dependencies"] {
+        if let Some(deps) = value.get(table).and_then(|d| d.as_table()) {
+            out.extend(deps.keys().cloned());
+        }
+    }
+    if let Some(ws) = value
+        .get("workspace")
+        .and_then(|w| w.get("dependencies"))
+        .and_then(|d| d.as_table())
+    {
+        out.extend(ws.keys().cloned());
+    }
+    Ok(out)
+}
+
+/// Dep-name set difference between two manifest contents: the dependency
+/// keys/names present at head but absent at base. A missing base file (new
+/// manifest) contributes every head dependency as new.
+fn new_deps(base: Option<&str>, head: &str, is_lock: bool) -> Result<Vec<String>, String> {
+    let head_deps = dep_names(head, is_lock)?;
+    let base_deps = match base {
+        Some(b) => dep_names(b, is_lock)?,
+        None => BTreeSet::new(),
+    };
+    Ok(head_deps.difference(&base_deps).cloned().collect())
 }
 
 #[cfg(test)]
@@ -295,6 +402,7 @@ assertions:
 
     #[test]
     fn max_files_changed_without_value_is_unknown() {
+        let repo = tempfile::tempdir().unwrap();
         let changed = vec!["a.rs".to_string()];
         let a = Assertion {
             kind: "max_files_changed".into(),
@@ -302,7 +410,10 @@ assertions:
             suite: None,
             value: None,
         };
-        assert_eq!(evaluate_one(&changed, &a).verdict, Verdict::Unknown);
+        assert_eq!(
+            evaluate_one(repo.path(), "b", "h", &changed, &a).verdict,
+            Verdict::Unknown
+        );
     }
 
     #[test]
@@ -348,6 +459,7 @@ assertions:
 
     #[test]
     fn inner_loop_semantics() {
+        let repo = tempfile::tempdir().unwrap();
         let changed = vec!["src/lib.rs".to_string()];
         let a = Assertion {
             kind: "no_new_dependency".into(),
@@ -355,41 +467,87 @@ assertions:
             suite: None,
             value: None,
         };
-        assert_eq!(evaluate_one(&changed, &a).verdict, Verdict::Pass);
+        assert_eq!(
+            evaluate_one(repo.path(), "b", "h", &changed, &a).verdict,
+            Verdict::Pass
+        );
         let a2 = Assertion {
             kind: "must_pass".into(),
             path: None,
             suite: None,
             value: None,
         };
-        assert_eq!(evaluate_one(&changed, &a2).verdict, Verdict::Deferred);
+        assert_eq!(
+            evaluate_one(repo.path(), "b", "h", &changed, &a2).verdict,
+            Verdict::Deferred
+        );
         let a3 = Assertion {
             kind: "api_compat".into(),
             path: None,
             suite: None,
             value: None,
         };
-        assert_eq!(evaluate_one(&changed, &a3).verdict, Verdict::Unknown);
+        assert_eq!(
+            evaluate_one(repo.path(), "b", "h", &changed, &a3).verdict,
+            Verdict::Unknown
+        );
         let a4 = Assertion {
             kind: "bogus_kind".into(),
             path: None,
             suite: None,
             value: None,
         };
-        assert_eq!(evaluate_one(&changed, &a4).verdict, Verdict::Unknown);
+        assert_eq!(
+            evaluate_one(repo.path(), "b", "h", &changed, &a4).verdict,
+            Verdict::Unknown
+        );
     }
 
     #[test]
-    fn dependency_manifest_change_fails_assertion() {
-        let changed = vec!["app/Cargo.toml".to_string()];
-        let a = Assertion {
-            kind: "no_new_dependency".into(),
-            path: None,
-            suite: None,
-            value: None,
-        };
-        let r = evaluate_one(&changed, &a);
-        assert_eq!(r.verdict, Verdict::Fail);
-        assert!(r.detail.contains("Cargo.toml"));
+    fn version_bump_is_not_a_new_dependency() {
+        let base =
+            "[package]\nname = \"x\"\nversion = \"0.3.1\"\n\n[dependencies]\nserde = \"1\"\n";
+        let head =
+            "[package]\nname = \"x\"\nversion = \"0.4.0\"\n\n[dependencies]\nserde = \"1\"\n";
+        assert!(new_deps(Some(base), head, false).unwrap().is_empty());
+    }
+
+    #[test]
+    fn added_dependency_key_is_new() {
+        let base = "[dependencies]\nserde = \"1\"\n";
+        let head = "[dependencies]\nserde = \"1\"\nserde_json = \"1\"\n";
+        assert_eq!(
+            new_deps(Some(base), head, false).unwrap(),
+            vec!["serde_json"]
+        );
+        // Renamed dependency = new name.
+        let renamed = "[dependencies]\nserde_derive2 = \"1\"\n";
+        assert_eq!(
+            new_deps(Some(base), renamed, false).unwrap(),
+            vec!["serde_derive2"]
+        );
+    }
+
+    #[test]
+    fn new_manifest_contributes_all_its_dependencies() {
+        let head = "[package]\nname = \"x\"\n\n[dependencies]\nserde = \"1\"\n";
+        assert_eq!(new_deps(None, head, false).unwrap(), vec!["serde"]);
+    }
+
+    #[test]
+    fn lockfile_compares_package_names() {
+        let base = "[[package]]\nname = \"serde\"\nversion = \"1.0.0\"\n";
+        let head = "[[package]]\nname = \"serde\"\nversion = \"1.1.0\"\n";
+        assert!(new_deps(Some(base), head, true).unwrap().is_empty());
+        let head2 = format!("{base}[[package]]\nname = \"serde_json\"\nversion = \"1.0.0\"\n");
+        assert_eq!(
+            new_deps(Some(base), &head2, true).unwrap(),
+            vec!["serde_json"]
+        );
+    }
+
+    #[test]
+    fn unparseable_manifest_is_an_error_for_the_caller() {
+        assert!(new_deps(Some("[dependencies]\nserde = \"1\"\n"), "not [ toml", false).is_err());
     }
 }

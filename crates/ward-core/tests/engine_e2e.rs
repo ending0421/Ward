@@ -831,7 +831,11 @@ fn evaluate_against_real_git_diff() {
     let repo = TestRepo::new();
     repo.write("src/lib.rs", "pub fn f() {}\n");
     let base = repo.commit_all("base");
-    repo.write("Cargo.toml", "[package]\nname = \"x\"\n");
+    // A NEW manifest whose dependency set gains serde → new dependency.
+    repo.write(
+        "Cargo.toml",
+        "[package]\nname = \"x\"\n\n[dependencies]\nserde = \"1\"\n",
+    );
     repo.write("src/1.rs", "a");
     repo.write("src/2.rs", "b");
     repo.write("src/3.rs", "c");
@@ -850,12 +854,53 @@ fn evaluate_against_real_git_diff() {
         .iter()
         .find(|r| r.assertion == "no_new_dependency")
         .unwrap();
-    assert_eq!(dep.verdict, spec::Verdict::Fail, "Cargo.toml changed");
+    assert_eq!(
+        dep.verdict,
+        spec::Verdict::Fail,
+        "a new dependency key must fail: {dep:?}"
+    );
+    assert!(dep.detail.contains("serde"), "detail: {}", dep.detail);
     let max = results
         .iter()
         .find(|r| r.assertion == "max_files_changed")
         .unwrap();
     assert_eq!(max.verdict, spec::Verdict::Fail, "7 files > 6");
+}
+
+#[test]
+fn version_bump_without_new_deps_passes_no_new_dependency() {
+    let repo = TestRepo::new();
+    repo.write(
+        "Cargo.toml",
+        "[package]\nname = \"x\"\nversion = \"0.3.1\"\n\n[dependencies]\nserde = \"1\"\n",
+    );
+    repo.write(
+        "Cargo.lock",
+        "[[package]]\nname = \"serde\"\nversion = \"1.0.0\"\n",
+    );
+    repo.write("src/lib.rs", "pub fn f() {}\n");
+    let base = repo.commit_all("base");
+    // Version-only edits to both manifests — no new dependency keys/names.
+    repo.write(
+        "Cargo.toml",
+        "[package]\nname = \"x\"\nversion = \"0.4.0\"\n\n[dependencies]\nserde = \"1\"\n",
+    );
+    repo.write(
+        "Cargo.lock",
+        "[[package]]\nname = \"serde\"\nversion = \"1.1.0\"\n",
+    );
+    let head = repo.commit_all("bump");
+    let parsed = spec::parse_spec(
+        "```yaml\nassertions:\n  - kind: no_new_dependency\n```",
+        "specs/t.md",
+    )
+    .unwrap();
+    let results = spec::evaluate(repo.path(), &parsed, &base, &head).unwrap();
+    assert_eq!(
+        results[0].verdict,
+        spec::Verdict::Pass,
+        "version bump is not a new dependency: {results:?}"
+    );
 }
 
 // ------------------------------------------------------------- store.rs
