@@ -28,7 +28,7 @@ catalog, metrics with graduation thresholds, competitive analysis — lives in
 | Phase 0 | M1 Spot prototype on Rust (self-dogfood) | ✅ implemented |
 | Phase 1 | L2 simhash + block-level fingerprints + feedback loop + M2 deterministic layer | ✅ implemented |
 | Phase 2 | M3 sandbox adjudication + M4 assertions + M2 narration (anchor-validated, F6 fallback) + M4-b intent drift + api_compat orchestration | ✅ implemented (LLM via `WARD_LLM_URL`; L3 hashing embedder with pluggable provider trait; Rust api_compat via cargo-semver-checks) |
-| Phase 3 | Five grammars + LanguageSpec, M5 context cards, M6 duplicate clustering | ✅ implemented |
+| Phase 3 | Five grammars + LanguageSpec (index **and** spot query; signature language auto-detected, `--language` override), M5 context cards, M6 duplicate clustering | ✅ implemented |
 
 ## One-line install (Claude Code / Codex / Cursor)
 
@@ -67,6 +67,12 @@ cargo build --release            # single static binary
   --intent "防抖函数，支持 leading/trailing" \
   --signature "pub fn debounce(f: &dyn Fn(u64), ms: u64) -> u8"
 
+# same, against a Kotlin codebase — the signature language is auto-detected
+# (all five grammars are compiled in; override with --language kotlin)
+./target/release/ward spot --repo . \
+  --intent "防抖函数，支持 leading/trailing" \
+  --signature "fun debounce(f: (Long) -> Unit, ms: Long): Unit"
+
 # deterministic change summary between two commits (M2)
 ./target/release/ward replay HEAD~3 HEAD --repo .
 
@@ -83,6 +89,22 @@ cargo build --release            # single static binary
 ./target/release/ward action <advisory_id> accepted
 ```
 
+### Configuration (`.ward/config.toml`)
+
+```toml
+# Languages Ward indexes and matches. All five grammars are compiled in;
+# this list restricts the set (case-insensitive names; unknown names are
+# ignored with a warning — fail-open). Defaults to all five.
+languages = ["rust", "kotlin", "swift", "java", "objc"]
+
+suppress = ["vendor/", "generated"]     # hide paths from Spot advisories
+top_k = 5                               # matches per advisory
+
+[thresholds]
+strong = 0.92   # initial value — recalibrate weekly against the golden set
+weak = 0.80
+```
+
 ### Connect as an MCP server (Claude Code)
 
 ```jsonc
@@ -97,10 +119,24 @@ cargo build --release            # single static binary
 }
 ```
 
-The daemon exposes `spot`, `replay`, `catch_run`, `verify_full`,
-`form_check`, and `spot_action` over stdio MCP, using the official Rust MCP
-SDK ([rmcp](https://crates.io/crates/rmcp)). All tools are fail-open and
-report structured results — a failure is an answer, never a broken session.
+The daemon exposes 10 tools over stdio MCP, using the official Rust MCP
+SDK ([rmcp](https://crates.io/crates/rmcp)):
+
+| Tool | Purpose |
+| :--- | :--- |
+| `spot` | Pre-generation duplicate check (M1); `language` param overrides signature auto-detection |
+| `spot_action` | Record the agent's disposition for an advisory (feedback loop) |
+| `replay` | Deterministic symbol-level change summary between two commits (M2) |
+| `catch_run` | Inner-loop lint/type precheck (M3, no Docker) |
+| `verify_full` | Outer-loop adjudication in a Docker sandbox (M3) |
+| `form_check` | Evaluate a task spec's assertions (M4) |
+| `intent_check` | Intent-drift comparison of a requirement against a diff (M4-b) |
+| `compat_check` | Public-API compatibility between two revisions |
+| `context_card` | Read a symbol's context card: fingerprint layers, mentions, change history |
+| `clusters` | Duplicate clusters at a similarity threshold (M6) |
+
+All tools are fail-open and report structured results — a failure is an
+answer, never a broken session.
 
 ### Hooks (Claude Code)
 
