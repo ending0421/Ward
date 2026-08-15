@@ -346,6 +346,60 @@ fn service_dry_run_emits_valid_launchd_unit() {
 }
 
 #[test]
+fn doctor_report_and_issue_dry_run() {
+    let repo = repo_with_rust();
+    let out = ward(&["index", "--repo", "."], repo.path());
+    assert!(out.status.success());
+    // doctor: redacted by default, symbols counted.
+    let out = ward(&["doctor", "--repo", ".", "--json"], repo.path());
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let d: serde_json::Value = serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).unwrap();
+    assert!(d["store"]["symbols"].as_i64().unwrap() >= 1);
+    assert!(d["redacted"] == true);
+    assert!(d["repo_path"].is_null(), "path must be redacted by default");
+    // bundle is written when requested.
+    let out = ward(&["doctor", "--repo", ".", "--bundle"], repo.path());
+    assert!(out.status.success());
+    assert!(String::from_utf8_lossy(&out.stdout).contains("bundle written"));
+    // issue create defaults to dry-run and never posts.
+    let out = ward(
+        &["issue", "--title", "测试", "--body", "复现步骤"],
+        repo.path(),
+    );
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("预览"), "dry-run by default: {stdout}");
+    assert!(stdout.contains("隐私确认"), "privacy checklist present");
+    // report on a seeded advisory.
+    let out = ward(
+        &[
+            "spot",
+            "--repo",
+            ".",
+            "--intent",
+            "x",
+            "--signature",
+            "pub fn f() -> u8",
+            "--json",
+        ],
+        repo.path(),
+    );
+    let json: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).unwrap();
+    let id = json["advisory_id"].as_str().unwrap().to_string();
+    let out = ward(&["report", &id, "--repo", ".", "--json"], repo.path());
+    assert!(out.status.success());
+    let rep: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).unwrap();
+    assert_eq!(rep["id"], id);
+    assert!(rep["snippets"].is_null(), "snippets opt-in only");
+}
+
+#[test]
 fn catch_run_reports_pass_for_true_command() {
     let repo = repo_with_rust();
     // Override the lint command to something deterministic.

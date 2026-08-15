@@ -184,6 +184,51 @@ enum Cmd {
         #[arg(long, default_value_t = 300)]
         interval_secs: u64,
     },
+    /// Environment & health probe with a privacy-redacted portable bundle
+    Doctor {
+        #[arg(default_value = ".", long)]
+        repo: PathBuf,
+        #[arg(long)]
+        json: bool,
+        /// Write the portable bundle (.ward/ward-doctor-<ts>.json)
+        #[arg(long)]
+        bundle: bool,
+        /// Opt-in: include source snippets in the bundle
+        #[arg(long)]
+        include_snippets: bool,
+        /// Opt-in: include the full config
+        #[arg(long)]
+        include_config: bool,
+        /// Opt-in: include the absolute repo path
+        #[arg(long)]
+        include_paths: bool,
+    },
+    /// Full context dump for one advisory (reproduction input)
+    Report {
+        advisory_id: String,
+        #[arg(default_value = ".", long)]
+        repo: PathBuf,
+        #[arg(long)]
+        json: bool,
+        #[arg(long)]
+        include_snippets: bool,
+    },
+    /// Compose and (optionally) open a GitHub issue with diagnostics
+    Issue {
+        #[arg(long)]
+        title: String,
+        #[arg(long, default_value = "")]
+        body: String,
+        #[arg(long)]
+        report: Option<String>,
+        #[arg(long)]
+        bundle: Option<PathBuf>,
+        #[arg(long, default_value = "ending0421/Ward")]
+        repo_owner: String,
+        /// Default: preview only. Without --yes, nothing is posted.
+        #[arg(long)]
+        yes: bool,
+    },
     /// Install (or remove) the background service (launchd / systemd)
     Service {
         #[command(subcommand)]
@@ -492,7 +537,7 @@ fn main() -> Result<()> {
         Cmd::Label { action } => match action {
             LabelAction::Next { count, json, repo } => {
                 let store = open_store(&repo)?;
-                let cands = ward_core::label::candidates(&store, count)?;
+                let cands = ward_core::label::candidates(&store, &repo, count)?;
                 if json {
                     println!("{}", serde_json::to_string_pretty(&cands)?);
                 } else if cands.is_empty() {
@@ -583,6 +628,139 @@ fn main() -> Result<()> {
                 println!("{}", serde_json::to_string_pretty(&report)?);
             } else {
                 print!("{}", ward_core::stats::render_table(&report));
+            }
+        }
+        Cmd::Doctor {
+            repo,
+            json,
+            bundle,
+            include_snippets,
+            include_config,
+            include_paths,
+        } => {
+            let opts = ward_core::doctor::DoctorOpts {
+                include_snippets,
+                include_config,
+                include_paths,
+            };
+            let report = ward_core::doctor::doctor(&repo, &opts)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!(
+                    "ward {} / {} / 仓库 {}（{} 符号）",
+                    report.ward_version, report.platform, report.repo_name, report.store.symbols
+                );
+                println!(
+                    "  语言: {}",
+                    report
+                        .store
+                        .languages
+                        .iter()
+                        .map(|(l, n)| format!("{l}={n}"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+                println!(
+                    "  性能: 索引 {:.2}s, spot 均值 {:.1}ms / 峰值 {:.1}ms",
+                    report.perf.index_secs, report.perf.spot_mean_ms, report.perf.spot_max_ms
+                );
+                println!(
+                    "  脱敏: {} | 指标行: {} | daemon 日志: {} 行",
+                    report.redacted,
+                    report.metrics_tail.len(),
+                    report.daemon_log_tail.len()
+                );
+            }
+            if bundle {
+                let path = ward_core::doctor::write_bundle(&repo, &report)?;
+                println!("bundle written: {}", path.display());
+            }
+        }
+        Cmd::Report {
+            advisory_id,
+            repo,
+            json,
+            include_snippets,
+        } => {
+            let store = open_store(&repo)?;
+            match ward_core::report::advisory_report(&store, &advisory_id)? {
+                None => anyhow::bail!("unknown advisory id {advisory_id}"),
+                Some(mut detail) => {
+                    if include_snippets {
+                        detail = ward_core::report::with_snippets(detail, &repo);
+                    }
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&detail)?);
+                    } else {
+                        println!("advisory {} (ts {})", detail.id, detail.ts);
+                        println!("  查询: {}", detail.query.as_deref().unwrap_or("-"));
+                        println!(
+                            "  处置: 自报 {:?} / 推断 {:?} (@ {:?})",
+                            detail.agent_action, detail.inferred_action, detail.inferred_commit_sha
+                        );
+                        println!(
+                            "  标注: {}",
+                            detail
+                                .labels
+                                .iter()
+                                .map(|l| format!("#{}={}", l.match_index, l.verdict))
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        );
+                        for (i, m) in detail.matches.iter().enumerate() {
+                            println!(
+                                "  match#{i} [{} {:.2}] {}:{} ({})",
+                                m.kind, m.similarity, m.path, m.lines, m.symbol
+                            );
+                            if let Some(snips) = &detail.snippets {
+                                if let Some(Some(sn)) = snips.get(i) {
+                                    println!("{sn}");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Cmd::Issue {
+            title,
+            body,
+            report,
+            bundle,
+            repo_owner,
+            yes,
+        } => {
+            let repo = PathBuf::from(".");
+            let doctor_report =
+                ward_core::doctor::doctor(&repo, &ward_core::doctor::DoctorOpts::default())?;
+            let final_body = ward_core::doctor::issue_body(
+                &title,
+                &body,
+                &doctor_report,
+                report.as_deref(),
+                None,
+            );
+            let dry_run = !yes;
+            let outcome = ward_core::doctor::create_issue(
+                &repo_owner,
+                &title,
+                &final_body,
+                bundle.as_deref(),
+                dry_run,
+            )?;
+            if outcome.dry_run {
+                println!("【预览（默认 dry-run）】以下内容将提交到 {repo_owner}：\n");
+                println!("{}", outcome.url_or_body);
+                if let Some(u) = outcome.bundle_url {
+                    println!("诊断包: {u}");
+                }
+                println!("\n确认无误后加 --yes 真正提交。");
+            } else {
+                println!("issue created: {}", outcome.url_or_body);
+                if let Some(u) = outcome.bundle_url {
+                    println!("诊断包 gist: {u}");
+                }
             }
         }
         Cmd::Daemon {

@@ -25,7 +25,11 @@ pub struct LabelCandidate {
 }
 
 /// Decode advisory matches into label candidates.
-pub fn candidates(store: &Store, limit: usize) -> Result<Vec<LabelCandidate>> {
+pub fn candidates(
+    store: &Store,
+    repo: &std::path::Path,
+    limit: usize,
+) -> Result<Vec<LabelCandidate>> {
     let mut out = Vec::new();
     let pending = store.pending_inferences()?;
     // Also include already-inferred advisories: inference is about adoption,
@@ -48,7 +52,7 @@ pub fn candidates(store: &Store, limit: usize) -> Result<Vec<LabelCandidate>> {
             if store.is_labeled(&id, i as i64)? {
                 continue;
             }
-            out.push(candidate_of(&id, i as i64, &parsed, m));
+            out.push(candidate_of(&id, i as i64, &parsed, m, repo));
             if out.len() >= limit {
                 return Ok(out);
             }
@@ -57,7 +61,13 @@ pub fn candidates(store: &Store, limit: usize) -> Result<Vec<LabelCandidate>> {
     Ok(out)
 }
 
-fn candidate_of(advisory_id: &str, idx: i64, parsed: &SpotResult, m: &SpotMatch) -> LabelCandidate {
+fn candidate_of(
+    advisory_id: &str,
+    idx: i64,
+    parsed: &SpotResult,
+    m: &SpotMatch,
+    repo: &std::path::Path,
+) -> LabelCandidate {
     LabelCandidate {
         advisory_id: advisory_id.to_string(),
         match_index: idx,
@@ -68,14 +78,14 @@ fn candidate_of(advisory_id: &str, idx: i64, parsed: &SpotResult, m: &SpotMatch)
         path: m.path.clone(),
         lines: m.lines.clone(),
         symbol: m.symbol.clone(),
-        snippet: snippet_of(&m.path, &m.lines),
+        snippet: snippet_of(repo, &m.path, &m.lines),
     }
 }
 
 /// Best-effort snippet: read the file and cut ±6 lines around the hit.
-fn snippet_of(path: &str, lines: &str) -> Option<String> {
+pub fn snippet_of(repo: &std::path::Path, path: &str, lines: &str) -> Option<String> {
     let start: usize = lines.split('-').next()?.parse().ok()?;
-    let content = std::fs::read_to_string(path).ok()?;
+    let content = std::fs::read_to_string(repo.join(path)).ok()?;
     let all: Vec<&str> = content.lines().collect();
     let lo = start.saturating_sub(7);
     let hi = (start + 5).min(all.len());
@@ -158,7 +168,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(&dir.path().join("index.db")).unwrap();
         seed(&store);
-        let cands = candidates(&store, 10).unwrap();
+        let cands = candidates(&store, dir.path(), 10).unwrap();
         assert_eq!(cands.len(), 1);
         assert_eq!(cands[0].query.as_deref(), Some("防抖函数"));
         assert_eq!(cands[0].kind, "near");
@@ -171,7 +181,7 @@ mod tests {
         let store = Store::open(&dir.path().join("index.db")).unwrap();
         seed(&store);
         label_match(&store, "adv_1", 0, "y").unwrap();
-        assert!(candidates(&store, 10).unwrap().is_empty());
+        assert!(candidates(&store, dir.path(), 10).unwrap().is_empty());
         assert_eq!(store.label_count().unwrap(), 1);
     }
 

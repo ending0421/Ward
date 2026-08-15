@@ -50,7 +50,7 @@ pub struct Block {
 }
 
 /// One match-level golden-set label (spec §9).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Label {
     pub id: Option<i64>,
     pub advisory_id: String,
@@ -65,6 +65,17 @@ pub struct Label {
 
 /// One label-matrix row: (language, kind, verdict, count, avg_similarity).
 pub type LabelRow = (String, String, String, i64, f64);
+
+/// One advisory row for reporting: (ts, query_hash, result_json,
+/// agent_action, inferred_action, inferred_commit_sha).
+pub type AdvisoryRow = (
+    i64,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
 
 /// One daily trend snapshot (spec §9).
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -725,6 +736,52 @@ impl Store {
         let first = pass(&runs[..10]);
         let last = pass(&runs[runs.len() - 10..]);
         Ok(Some(last - first))
+    }
+
+    /// One advisory row: (ts, query_hash, result_json, agent_action,
+    /// inferred_action, inferred_commit_sha).
+    pub fn advisory_row(&self, id: &str) -> Result<Option<AdvisoryRow>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT ts, COALESCE(query_hash,''), COALESCE(result_json,'[]'),
+                        agent_action, inferred_action, inferred_commit_sha
+                 FROM advisories WHERE id = ?1",
+                params![id],
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                    ))
+                },
+            )
+            .optional()?)
+    }
+
+    /// Labels for one advisory, ordered by match index.
+    pub fn labels_for_advisory(&self, advisory_id: &str) -> Result<Vec<Label>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, advisory_id, match_index, query_hash, language, kind, similarity, verdict, ts
+             FROM labels WHERE advisory_id = ?1 ORDER BY match_index ASC",
+        )?;
+        let rows = stmt.query_map(params![advisory_id], |r| {
+            Ok(Label {
+                id: r.get(0)?,
+                advisory_id: r.get(1)?,
+                match_index: r.get(2)?,
+                query_hash: r.get(3)?,
+                language: r.get(4)?,
+                kind: r.get(5)?,
+                similarity: r.get(6)?,
+                verdict: r.get(7)?,
+                ts: r.get(8)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
     /// All spot advisories: (id, ts, result_json) — newest first.
