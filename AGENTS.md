@@ -22,6 +22,9 @@
 ## 提交纪律
 
 7. Commit message 遵循 conventional commits（feat/fix/refactor/test/docs/ci/style/build）。
+7a. **AI 提交双标记（强制，dogfood 约定）**：AI 产出的 commit 必须带
+    `[ai]` 主题前缀 + `Co-authored-by: AI <ai@ward.dev>` trailer——
+    这是治理报表"AI vs 人类"分桶的识别依据，缺失标记的提交按"未知"统计。
 8. 涉及规格任务的改动引用条款号：`[spec:<条款>]`。
 9. 需求/断言有变 → 改 `specs/` 走 PR 评审，不绕过断言（F12）。
 
