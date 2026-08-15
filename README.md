@@ -197,9 +197,12 @@ driven**:
 4. **Artifacts** — five targets: Linux x86_64 + aarch64 (cross), macOS
    x86_64 + aarch64, Windows x86_64. Each package is a tar.gz/zip containing
    `ward`, `ward-mcp`, LICENSE, README, hooks, examples and docs.
-5. **Release Notes** — auto-generated from conventional-commit history
-   (`scripts/gen-release-notes.sh`), grouped by Features / Fixes / Tests /
-   CI / Docs.
+5. **Release Notes** — curated per release in
+   `docs/release-notes/vX.Y.Z.md` (template: `_TEMPLATE.md`; highlights /
+   breaking changes / migration / verification numbers / contributors),
+   reviewed with the code; the pipeline **fails the release when the curated
+   file is missing**, and appends the auto-generated grouped Full Changelog
+   (`scripts/gen-release-notes.sh`).
 6. **Publish** — `gh release create` with SHA256SUMS.txt, prerelease flag
    for `-rc`/`-beta` tags, and asset re-upload (--clobber) when re-running.
 

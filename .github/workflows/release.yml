@@ -46,6 +46,12 @@ jobs:
             VERSION="$WORKSPACE_VERSION"
             echo "::notice::workflow_dispatch: releasing $TAG from ${GITHUB_REF_NAME}"
           fi
+          NOTES="docs/release-notes/${TAG}.md"
+          if [ ! -f "$NOTES" ]; then
+            echo "::error::发布被阻断：缺少人工审校的 Release Notes（$NOTES）。"
+            echo "::error::请从 docs/release-notes/_TEMPLATE.md 创建并随 PR 评审，再重新打 tag。"
+            exit 1
+          fi
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
@@ -149,10 +155,15 @@ jobs:
           sha256sum ward-* > SHA256SUMS.txt
           cat SHA256SUMS.txt
 
-      - name: Generate release notes
+      - name: Compose release notes (curated + auto changelog)
         run: |
-          scripts/gen-release-notes.sh > dist/NOTES.md
-          head -40 dist/NOTES.md
+          TAG="${{ needs.version-check.outputs.tag }}"
+          {
+            cat "docs/release-notes/${TAG}.md"
+            echo ""
+            scripts/gen-release-notes.sh
+          } > dist/NOTES.md
+          head -30 dist/NOTES.md
 
       - name: Create or update the GitHub Release
         run: |
