@@ -26,6 +26,28 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
+enum LabelAction {
+    /// Show the next unlabeled match with its code context
+    Next {
+        #[arg(long, default_value_t = 1)]
+        count: usize,
+        #[arg(long)]
+        json: bool,
+        #[arg(default_value = ".", long)]
+        repo: PathBuf,
+    },
+    /// Record a verdict: y (relevant) or n (not relevant)
+    Set {
+        advisory_id: String,
+        match_index: i64,
+        #[arg(value_parser = ["y", "n"])]
+        verdict: String,
+        #[arg(default_value = ".", long)]
+        repo: PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
 enum Cmd {
     /// Write a starter .ward/config.toml
     Init {
@@ -108,6 +130,33 @@ enum Cmd {
     /// Infer adoption outcomes for pending advisories from the next commit
     /// (spec §3-M1 objective channel)
     Infer {
+        #[arg(default_value = ".", long)]
+        repo: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Golden-set labeling: show the next unlabeled match (or record a
+    /// verdict for one)
+    Label {
+        #[command(subcommand)]
+        action: LabelAction,
+    },
+    /// Threshold calibration from golden-set labels (Wilson intervals)
+    Calibrate {
+        #[arg(default_value = ".", long)]
+        repo: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Record an idempotent daily trend snapshot
+    Snapshot {
+        #[arg(default_value = ".", long)]
+        repo: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Governance report: adoption, clusters, constraint decay (CLI + JSON)
+    Stats {
         #[arg(default_value = ".", long)]
         repo: PathBuf,
         #[arg(long)]
@@ -411,6 +460,102 @@ fn main() -> Result<()> {
                     report.rejected,
                     report.unknown
                 );
+            }
+        }
+        Cmd::Label { action } => match action {
+            LabelAction::Next { count, json, repo } => {
+                let store = open_store(&repo)?;
+                let cands = ward_core::label::candidates(&store, count)?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&cands)?);
+                } else if cands.is_empty() {
+                    println!("没有未标注的 match。跑几次 spot 后再来。");
+                } else {
+                    for c in cands {
+                        println!(
+                            "advisory={} match={} [{} {:.2}] {}:{} ({})\n  查询: {}\n{}",
+                            c.advisory_id,
+                            c.match_index,
+                            c.kind,
+                            c.similarity,
+                            c.path,
+                            c.lines,
+                            c.symbol,
+                            c.query.as_deref().unwrap_or("-"),
+                            c.snippet.as_deref().unwrap_or("(snippet unavailable)")
+                        );
+                        println!(
+                            "  标注: ward label set {} {} y|n",
+                            c.advisory_id, c.match_index
+                        );
+                        println!();
+                    }
+                }
+            }
+            LabelAction::Set {
+                advisory_id,
+                match_index,
+                verdict,
+                repo,
+            } => {
+                let store = open_store(&repo)?;
+                ward_core::label::label_match(&store, &advisory_id, match_index, &verdict)?;
+                println!("labeled {advisory_id}#{match_index} = {verdict}");
+            }
+        },
+        Cmd::Calibrate { repo, json } => {
+            let store = open_store(&repo)?;
+            let report = ward_core::calibrate::calibrate(&store)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!("标注总数: {} | {}", report.total_verdicts, report.note);
+                for r in &report.rows {
+                    if r.yes + r.no == 0 {
+                        continue;
+                    }
+                    println!(
+                        "  >= {:.2}: {}/{} = {:.0}% (95% CI {:.0}%-{:.0}%){}",
+                        r.threshold,
+                        r.yes,
+                        r.yes + r.no,
+                        r.precision * 100.0,
+                        r.ci_low * 100.0,
+                        r.ci_high * 100.0,
+                        if r.sufficient_sample {
+                            ""
+                        } else {
+                            " [样本不足]"
+                        }
+                    );
+                }
+                match report.suggested_strong {
+                    Some(t) => println!("建议 strong 阈值: >= {t}（--apply 手动写入 config）"),
+                    None => println!("暂无可靠建议阈值"),
+                }
+            }
+        }
+        Cmd::Snapshot { repo, json } => {
+            let store = open_store(&repo)?;
+            let cfg = load_config(&repo);
+            let snap = ward_core::stats::snapshot_now(&repo, &store, &cfg)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&snap)?);
+            } else {
+                println!(
+                    "snapshot day={} symbols={} clusters={} advisories={} labels={}",
+                    snap.ts, snap.symbols, snap.clusters, snap.advisories, snap.labels
+                );
+            }
+        }
+        Cmd::Stats { repo, json } => {
+            let store = open_store(&repo)?;
+            let cfg = load_config(&repo);
+            let report = ward_core::stats::stats(&repo, &store, &cfg)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                print!("{}", ward_core::stats::render_table(&report));
             }
         }
         Cmd::SetupHooks { repo, remove } => {

@@ -25,7 +25,7 @@ use crate::fingerprint;
 use crate::git;
 use crate::index;
 use crate::lang::{Language, RUST};
-use crate::search::SpotResult;
+
 use crate::store::Store;
 
 /// Similarity above which a newly introduced symbol counts as "similar to
@@ -109,7 +109,7 @@ fn added_symbols(repo: &Path, commit: &str) -> Vec<index::Extracted> {
 /// Resolve the top-1 match of an advisory into the stored symbol (by
 /// path+name at query time). `None` when the index no longer holds it.
 fn top1_symbol(store: &Store, result_json: &str) -> Option<crate::store::Symbol> {
-    let parsed: SpotResult = serde_json::from_str(result_json).ok()?;
+    let parsed = crate::search::parse_spot_payload(result_json)?;
     let top = parsed.matches.first()?.clone();
     store
         .all_symbols()

@@ -267,6 +267,58 @@ fn setup_hooks_and_infer_roundtrip() {
 }
 
 #[test]
+fn stats_and_calibrate_report_from_seeded_data() {
+    let repo = repo_with_rust();
+    let out = ward(&["index", "--repo", "."], repo.path());
+    assert!(out.status.success());
+    // Seed one advisory + one label via the real CLI.
+    let out = ward(
+        &[
+            "spot",
+            "--repo",
+            ".",
+            "--intent",
+            "防抖",
+            "--signature",
+            "pub fn debounce() -> u8",
+            "--json",
+        ],
+        repo.path(),
+    );
+    assert!(out.status.success());
+    let json: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).unwrap();
+    let id = json["advisory_id"].as_str().unwrap().to_string();
+    // Label the first match (if any) or skip the label assertions gracefully.
+    if !json["matches"].as_array().unwrap().is_empty() {
+        let out = ward(&["label", "set", &id, "0", "y", "--repo", "."], repo.path());
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let out = ward(&["calibrate", "--repo", ".", "--json"], repo.path());
+        assert!(out.status.success());
+        let cal: serde_json::Value =
+            serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).unwrap();
+        assert!(cal["total_verdicts"].as_i64().unwrap() >= 1);
+        assert!(cal["note"].as_str().unwrap().contains("样本量不足"));
+    }
+    // stats must always assemble a report with series.
+    let out = ward(&["stats", "--repo", ".", "--json"], repo.path());
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let rep: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).unwrap();
+    assert_eq!(rep["schema_version"], 1);
+    assert!(rep["series"].as_array().unwrap().len() >= 4);
+    assert_eq!(rep["stability"], "unstable");
+}
+
+#[test]
 fn catch_run_reports_pass_for_true_command() {
     let repo = repo_with_rust();
     // Override the lint command to something deterministic.

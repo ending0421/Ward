@@ -64,7 +64,7 @@ pub struct Label {
 pub type LabelRow = (String, String, String, i64, f64);
 
 /// One daily trend snapshot (spec §9).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Snapshot {
     pub ts: i64,
     pub symbols: i64,
@@ -468,6 +468,16 @@ impl Store {
             .query_row("SELECT COUNT(*) FROM labels", [], |r| r.get(0))?)
     }
 
+    /// All labels as (similarity, verdict) — calibration input. Labels
+    /// without a stored similarity are excluded (they cannot be bucketed).
+    pub fn labels_with_similarity(&self) -> Result<Vec<(f64, String)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT similarity, verdict FROM labels WHERE similarity IS NOT NULL")?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
     /// Labels grouped by (language, kind, verdict) for calibration reports.
     pub fn label_matrix(&self) -> Result<Vec<LabelRow>> {
         let mut stmt = self.conn.prepare(
@@ -635,6 +645,67 @@ impl Store {
             ],
         )?;
         Ok(())
+    }
+
+    /// Adoption counts across both channels:
+    /// (inferred_total, inferred_accepted, inferred_rejected,
+    ///  self_total, self_accepted).
+    pub fn adoption_counts(&self) -> Result<(i64, i64, i64, i64, i64)> {
+        Ok(self.conn.query_row(
+            "SELECT COALESCE(SUM(inferred_action IS NOT NULL),0),
+                    COALESCE(SUM(inferred_action = 'accepted'),0),
+                    COALESCE(SUM(inferred_action = 'rejected'),0),
+                    COALESCE(SUM(agent_action IS NOT NULL),0),
+                    COALESCE(SUM(agent_action = 'accepted'),0)
+             FROM advisories",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+        )?)
+    }
+
+    /// All contract runs ordered by ts (for decay analysis).
+    pub fn all_contract_runs(&self) -> Result<Vec<ContractRun>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT spec_path, commit_sha, ts, assertion, verdict, detail
+             FROM contract_runs ORDER BY ts ASC",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(ContractRun {
+                spec_path: r.get(0)?,
+                commit_sha: r.get(1)?,
+                ts: r.get(2)?,
+                assertion: r.get(3)?,
+                verdict: r.get(4)?,
+                detail: r.get(5)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// Constraint-decay hint: pass rate of the last 10 runs minus the first
+    /// 10 (spec §9 longitudinal analysis, coarse approximation).
+    pub fn constraint_decay_hint(&self) -> Result<Option<f64>> {
+        let runs = self.all_contract_runs()?;
+        if runs.len() < 10 {
+            return Ok(None);
+        }
+        let pass = |slice: &[ContractRun]| -> f64 {
+            let ok = slice.iter().filter(|r| r.verdict == "pass").count();
+            ok as f64 / slice.len() as f64
+        };
+        let first = pass(&runs[..10]);
+        let last = pass(&runs[runs.len() - 10..]);
+        Ok(Some(last - first))
+    }
+
+    /// All spot advisories: (id, ts, result_json) — newest first.
+    pub fn advisory_payloads(&self) -> Result<Vec<(String, i64, String)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, ts, COALESCE(result_json,'[]') FROM advisories
+             WHERE tool = 'spot' ORDER BY ts DESC",
+        )?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
     /// Advisories awaiting outcome inference: (id, ts, result_json).

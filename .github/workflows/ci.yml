@@ -37,6 +37,20 @@ jobs:
           print("dogfood spot OK:", [(m["path"], m["lines"], m["similarity"]) for m in r["matches"]])
           EOF
 
+  spec-gate:
+    name: task spec gate (form-check --ci)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build ward
+        run: cargo build --release -p ward-cli
+      - name: Form-check the active task spec (fail-closed)
+        run: ./target/release/ward form-check --repo . --spec specs/2026-08-gov-data.md --ci
+
   meaningful-smoke:
     name: meaningfulness harness (recall/precision + adversarial semantics)
     runs-on: ubuntu-latest

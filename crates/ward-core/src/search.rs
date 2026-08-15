@@ -43,6 +43,10 @@ pub struct SpotResult {
     pub stale: bool,
     pub matches: Vec<SpotMatch>,
     pub advisory_id: String,
+    /// The original intent text (added for label context; older advisories
+    /// lack it and deserialize to `None`).
+    #[serde(default)]
+    pub query: Option<String>,
 }
 
 /// Advisory grade, with the discipline that text-only evidence can never be
@@ -375,6 +379,15 @@ pub fn spot(
             .unwrap_or_default(),
         &query_hash[..8]
     );
+    let result = SpotResult {
+        as_of: fresh.as_of,
+        stale: fresh.stale,
+        matches,
+        advisory_id: advisory_id.clone(),
+        query: Some(intent.to_string()),
+    };
+    // Store the FULL payload — the inference channel and the golden-set
+    // labeling both re-read it (query text, per-match similarity).
     store.record_advisory(&Advisory {
         id: advisory_id.clone(),
         tool: "spot".into(),
@@ -383,15 +396,26 @@ pub fn spot(
             .map(|d| d.as_secs() as i64)
             .unwrap_or_default(),
         query_hash,
-        result_json: serde_json::to_string(&matches).unwrap_or_else(|_| "[]".into()),
+        result_json: serde_json::to_string(&result).unwrap_or_else(|_| "[]".into()),
         ..Default::default()
     })?;
 
-    Ok(SpotResult {
-        as_of: fresh.as_of,
-        stale: fresh.stale,
+    Ok(result)
+}
+
+/// Parse a stored advisory payload, accepting both the current full
+/// `SpotResult` shape and the legacy bare `Vec<SpotMatch>` array.
+pub fn parse_spot_payload(json: &str) -> Option<SpotResult> {
+    if let Ok(full) = serde_json::from_str::<SpotResult>(json) {
+        return Some(full);
+    }
+    let matches: Vec<SpotMatch> = serde_json::from_str(json).ok()?;
+    Some(SpotResult {
+        as_of: None,
+        stale: false,
         matches,
-        advisory_id,
+        advisory_id: String::new(),
+        query: None,
     })
 }
 
