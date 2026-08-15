@@ -34,11 +34,15 @@ fn load_config(repo: &std::path::Path) -> WardConfig {
 pub struct SpotParams {
     /// What the agent intends to implement, in natural language.
     pub intent: String,
-    /// Optional proposed signature (Rust). Fingerprint evidence requires it.
+    /// Optional proposed signature in any supported language (Rust, Kotlin,
+    /// Swift, Java, ObjC). Fingerprint evidence requires it.
     pub proposed_signature: Option<String>,
     /// Optional already-written body — enables block-level fingerprint
     /// matches (the PostToolUse flow).
     pub proposed_body: Option<String>,
+    /// Signature language override ("rust|kotlin|swift|java|objc");
+    /// auto-detected from the snippet when omitted.
+    pub language: Option<String>,
     /// Repository root; defaults to the daemon's working directory.
     pub repo: Option<String>,
     /// Number of matches to return.
@@ -158,6 +162,10 @@ impl WardMcp {
         }
         let result = (|| -> anyhow::Result<_> {
             let store = Store::open(&Store::default_path(&repo))?;
+            let lang = p
+                .language
+                .as_deref()
+                .and_then(ward_core::lang::Language::from_name);
             ward_core::search::spot(
                 &repo,
                 &store,
@@ -165,6 +173,7 @@ impl WardMcp {
                 &p.intent,
                 p.proposed_signature.as_deref(),
                 p.proposed_body.as_deref(),
+                lang,
             )
         })();
         match result {

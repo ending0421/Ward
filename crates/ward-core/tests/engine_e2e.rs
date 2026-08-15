@@ -7,6 +7,7 @@ mod common;
 use common::TestRepo;
 use ward_core::config::WardConfig;
 use ward_core::diff::{ChangeKind, replay};
+use ward_core::lang::Language;
 use ward_core::store::Store;
 use ward_core::{fresh, git, index, search, spec, verify};
 
@@ -168,6 +169,110 @@ fn index_repo_handles_all_five_languages() {
 }
 
 #[test]
+fn languages_config_gates_indexing() {
+    let repo = TestRepo::new();
+    for (path, content) in MULTI_LANG_FILES {
+        repo.write(path, content);
+    }
+    repo.commit_all("c1");
+    let mut cfg = cfg();
+    cfg.languages = vec!["rust".to_string()];
+    let report = index::index_repo(repo.path(), &cfg).unwrap();
+    assert_eq!(
+        report.files_indexed, 1,
+        "only the .rs file may be indexed: {report:?}"
+    );
+    assert_eq!(report.files_skipped_language, 4);
+
+    let store = Store::open(&Store::default_path(repo.path())).unwrap();
+    let languages: std::collections::BTreeSet<String> = store
+        .all_symbols()
+        .unwrap()
+        .iter()
+        .map(|s| s.language.clone())
+        .collect();
+    assert_eq!(
+        languages.len(),
+        1,
+        "store must only hold rust: {languages:?}"
+    );
+    assert!(languages.contains("rust"));
+}
+
+#[test]
+fn spot_resolves_kotlin_signatures_structurally() {
+    let repo = TestRepo::new();
+    repo.write(
+        "src/util.kt",
+        "package com.example\n\nfun debounce(f: (Long) -> Unit, ms: Long): Unit { f(ms) }\n",
+    );
+    repo.commit_all("c1");
+    index::index_repo(repo.path(), &cfg()).unwrap();
+    let store = Store::open(&Store::default_path(repo.path())).unwrap();
+
+    // Signature-only query: detected as Kotlin, strong fingerprint match.
+    let r = search::spot(
+        repo.path(),
+        &store,
+        &cfg(),
+        "防抖函数",
+        Some("fun debounce(f: (Long) -> Unit, ms: Long): Unit"),
+        None,
+        None,
+    )
+    .unwrap();
+    let hit = r
+        .matches
+        .iter()
+        .find(|m| m.symbol == "debounce")
+        .expect("kotlin symbol must be recalled");
+    assert!(
+        hit.similarity >= 0.92,
+        "strong fingerprint match expected, got {:?}",
+        r.matches
+    );
+    assert!(matches!(hit.kind.as_str(), "structural" | "near"));
+
+    // Explicit language hint must not break the same query.
+    let r2 = search::spot(
+        repo.path(),
+        &store,
+        &cfg(),
+        "防抖函数",
+        Some("fun debounce(f: (Long) -> Unit, ms: Long): Unit"),
+        None,
+        Some(Language::Kotlin),
+    )
+    .unwrap();
+    assert!(r2.matches.iter().any(|m| m.symbol == "debounce"));
+
+    // Rust grammar must NOT swallow the Kotlin snippet (no cross-language
+    // fingerprint match on a rust-only store).
+    let rust_repo = TestRepo::new();
+    rust_repo.write("src/only.rs", "pub fn unrelated() -> u8 { 1 }");
+    rust_repo.commit_all("c1");
+    index::index_repo(rust_repo.path(), &cfg()).unwrap();
+    let rust_store = Store::open(&Store::default_path(rust_repo.path())).unwrap();
+    let r3 = search::spot(
+        rust_repo.path(),
+        &rust_store,
+        &cfg(),
+        "防抖函数",
+        Some("fun debounce(f: (Long) -> Unit, ms: Long): Unit"),
+        None,
+        None,
+    )
+    .unwrap();
+    assert!(
+        r3.matches
+            .iter()
+            .all(|m| m.similarity < 0.92 || m.symbol != "unrelated"),
+        "kotlin snippet must not fingerprint-match rust symbols: {:?}",
+        r3.matches
+    );
+}
+
+#[test]
 fn incremental_indexing_skips_unchanged_files() {
     let repo = TestRepo::new();
     repo.write("src/lib.rs", "pub fn f() {}\n");
@@ -224,6 +329,7 @@ fn spot_finds_structural_match_end_to_end() {
         "防抖函数",
         Some("pub fn debounce(f: &dyn Fn(u64), ms: u64) -> u8"),
         None,
+        None,
     )
     .unwrap();
     assert!(!r.stale);
@@ -248,7 +354,16 @@ fn spot_l1_structural_equality_when_signature_is_full_body() {
     let store = Store::open(&Store::default_path(repo.path())).unwrap();
     // Passing the *complete* function as the signature hits the L1 exact
     // structural-equality layer (normalized full-tree hash).
-    let r = search::spot(repo.path(), &store, &cfg(), "防抖", Some(fn_src), None).unwrap();
+    let r = search::spot(
+        repo.path(),
+        &store,
+        &cfg(),
+        "防抖",
+        Some(fn_src),
+        None,
+        None,
+    )
+    .unwrap();
     assert!(
         r.matches
             .iter()
@@ -362,6 +477,7 @@ fn spot_block_layer_matches_body_windows() {
         "一样的语句序列",
         None,
         Some(body),
+        None,
     )
     .unwrap();
     assert!(
@@ -378,7 +494,7 @@ fn spot_without_signature_is_weak_never_strong() {
     repo.commit_all("c1");
     index::index_repo(repo.path(), &cfg()).unwrap();
     let store = Store::open(&Store::default_path(repo.path())).unwrap();
-    let r = search::spot(repo.path(), &store, &cfg(), "debounce", None, None).unwrap();
+    let r = search::spot(repo.path(), &store, &cfg(), "debounce", None, None, None).unwrap();
     for m in &r.matches {
         assert_ne!(m.kind, "structural");
         assert_ne!(m.kind, "near", "text-only evidence must not be graded near");
@@ -395,7 +511,7 @@ fn spot_respects_suppression_and_top_k() {
     cfg.suppress = vec!["vendor/".into()];
     index::index_repo(repo.path(), &cfg).unwrap();
     let store = Store::open(&Store::default_path(repo.path())).unwrap();
-    let r = search::spot(repo.path(), &store, &cfg, "alpha", None, None).unwrap();
+    let r = search::spot(repo.path(), &store, &cfg, "alpha", None, None, None).unwrap();
     assert!(r.matches.iter().all(|m| !m.path.starts_with("vendor")));
 }
 
@@ -425,6 +541,7 @@ fn spot_top_k_truncates_textual_matches() {
         &store,
         &cfg(),
         "alpha bravo charlie delta echo",
+        None,
         None,
         None,
     )
@@ -462,7 +579,7 @@ fn spot_on_empty_index_fails_open() {
     repo.commit_all("c1");
     // Never indexed: store exists but is empty.
     let store = Store::open(&Store::default_path(repo.path())).unwrap();
-    let r = search::spot(repo.path(), &store, &cfg(), "whatever", None, None).unwrap();
+    let r = search::spot(repo.path(), &store, &cfg(), "whatever", None, None, None).unwrap();
     assert!(r.matches.is_empty());
     assert!(r.stale, "empty index must report stale");
 }

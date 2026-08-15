@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use crate::config::WardConfig;
 use crate::embedding::EmbeddingProvider;
 use crate::fingerprint;
-use crate::lang::RUST;
+use crate::lang::Language;
 use crate::store::{Advisory, Store, Symbol};
 
 /// One advisory match.
@@ -205,6 +205,57 @@ fn line_range(path: &Path, start_byte: i64, end_byte: i64) -> String {
     }
 }
 
+/// Parse a proposed signature with the grammar that accepts it.
+///
+/// An explicit language hint wins; otherwise every compiled-in grammar is
+/// tried in rollout order (Rust first — backward compatible). A parse is
+/// accepted when its first named child is a symbol kind for that language
+/// (or the spec's query-alias kind — Rust's tolerant signature-only parses
+/// yield `function_signature_item`). Error-free parses are preferred over
+/// error-tolerant ones, and a snippet no grammar accepts yields no
+/// fingerprint evidence at all: feeding garbage through L1/L2 would
+/// fabricate fingerprints (F3 fail-open, no evidence beats fake evidence).
+pub fn parse_query_language(
+    sig: &str,
+    hint: Option<Language>,
+) -> Option<(Language, tree_sitter::Tree)> {
+    let mut order: Vec<Language> = Vec::with_capacity(Language::ALL.len() + 1);
+    if let Some(lang) = hint {
+        order.push(lang);
+    }
+    order.extend(Language::ALL);
+    let mut tolerant: Option<(Language, tree_sitter::Tree)> = None;
+    for lang in order {
+        let Some(tree) = fingerprint::parse(lang, sig) else {
+            continue;
+        };
+        // Scope the tree borrow: TreeCursor holds a reference until dropped.
+        let (accepted, has_error) = {
+            let root = tree.root_node();
+            let mut cursor = root.walk();
+            let Some(first) = root.named_children(&mut cursor).next() else {
+                continue;
+            };
+            let spec = lang.spec();
+            let aliased = spec
+                .query_alias
+                .is_some_and(|(from, _)| first.kind() == from);
+            let ok = spec.is_symbol_kind(first.kind()) || aliased;
+            (ok, root.has_error())
+        };
+        if !accepted {
+            continue;
+        }
+        if !has_error {
+            return Some((lang, tree));
+        }
+        if tolerant.is_none() {
+            tolerant = Some((lang, tree));
+        }
+    }
+    tolerant
+}
+
 /// Run the full Spot pipeline and record the advisory.
 pub fn spot(
     repo: &Path,
@@ -213,6 +264,7 @@ pub fn spot(
     intent: &str,
     proposed_signature: Option<&str>,
     proposed_body: Option<&str>,
+    language: Option<Language>,
 ) -> Result<SpotResult> {
     let symbols = store.all_symbols()?;
     let bm25 = Bm25::build(&symbols);
@@ -225,20 +277,21 @@ pub fn spot(
     let mut matches: Vec<SpotMatch> = Vec::new();
     let mut seen: HashSet<usize> = HashSet::new();
 
-    // Layer 1: exact structural equality (L1) when the signature parses.
-    let parsed = proposed_signature.and_then(fingerprint::parse_rust);
-    let query_struct = parsed.as_ref().and_then(|t| {
+    // Layer 1: exact structural equality (L1) when the signature parses —
+    // in any supported language, not just Rust.
+    let parsed = proposed_signature.and_then(|sig| parse_query_language(sig, language));
+    let query_struct = parsed.as_ref().and_then(|(lang, t)| {
         // Node-level form: the stored struct_hash covers the symbol node,
         // not the whole tree (whose root wrapper would never match).
         let root = t.root_node();
         let mut cursor = root.walk();
         root.named_children(&mut cursor)
             .next()
-            .map(|n| fingerprint::struct_hash_of(&n, &RUST))
+            .map(|n| fingerprint::struct_hash_of(&n, lang.spec()))
     });
     let query_sim = parsed
         .as_ref()
-        .and_then(|t| fingerprint::signature_simhash(t, &RUST));
+        .and_then(|(lang, t)| fingerprint::signature_simhash(t, lang.spec()));
 
     if let Some(qs) = &query_struct {
         for sym in symbols
@@ -483,6 +536,37 @@ mod tests {
         let bm = Bm25::build(&syms);
         let top = bm.recall(&tokenize("debounce leading trailing"), 5);
         assert_eq!(top[0].0, 0);
+    }
+
+    #[test]
+    fn parse_query_language_detects_all_grammars() {
+        use crate::lang::Language;
+        // Kotlin and Swift snippets must not be claimed by the Rust grammar.
+        let (lang, tree) =
+            parse_query_language("fun debounce(f: (Long) -> Unit, ms: Long): Unit", None)
+                .expect("kotlin snippet must parse");
+        assert_eq!(lang, Language::Kotlin);
+        assert!(!tree.root_node().has_error());
+        // The Swift grammar only accepts top-level funcs with a body; an
+        // empty `{}` parses clean and the signature simhash excludes it.
+        let (lang, _) = parse_query_language(
+            "func debounce(_ f: (UInt64) -> Void, ms: UInt64) -> Void {}",
+            None,
+        )
+        .expect("swift snippet must parse");
+        assert_eq!(lang, Language::Swift);
+        // Rust stays Rust (backward compatibility).
+        let (lang, _) =
+            parse_query_language("pub fn debounce(f: &dyn Fn(u64), ms: u64) -> u8", None)
+                .expect("rust snippet must parse");
+        assert_eq!(lang, Language::Rust);
+        // An explicit hint wins over auto-detection.
+        let (lang, _) = parse_query_language("fun f(): Unit", Some(Language::Kotlin))
+            .expect("kotlin hint must parse");
+        assert_eq!(lang, Language::Kotlin);
+        // A snippet no grammar accepts yields no fingerprint evidence —
+        // not a fabricated one.
+        assert!(parse_query_language("fn broken( {", None).is_none());
     }
 
     #[test]

@@ -81,6 +81,10 @@ enum Cmd {
         signature: Option<String>,
         #[arg(long)]
         body: Option<String>,
+        /// Signature language override ("rust|kotlin|swift|java|objc");
+        /// auto-detected from the snippet when omitted.
+        #[arg(long, value_name = "LANG")]
+        language: Option<String>,
         #[arg(default_value = ".", long)]
         repo: PathBuf,
         #[arg(long)]
@@ -332,11 +336,25 @@ fn main() -> Result<()> {
             intent,
             signature,
             body,
+            language,
             repo,
             json,
         } => {
             let cfg = load_config(&repo);
             let store = open_store(&repo)?;
+            let lang = match language
+                .as_deref()
+                .map(ward_core::lang::Language::from_name)
+            {
+                Some(Some(l)) => Some(l),
+                Some(None) => {
+                    eprintln!(
+                        "ward: unknown language {language:?}; auto-detecting from the signature"
+                    );
+                    None
+                }
+                None => None,
+            };
             let result = search::spot(
                 &repo,
                 &store,
@@ -344,6 +362,7 @@ fn main() -> Result<()> {
                 &intent,
                 signature.as_deref(),
                 body.as_deref(),
+                lang,
             )?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&result)?);

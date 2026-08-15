@@ -102,7 +102,7 @@ fn is_public(node: &Node, source: &str) -> bool {
 /// The signature form of a symbol: the whole declaration minus its body
 /// (functions/methods) or the whole declaration (structs/enums/traits).
 fn signature_hash(node: &Node, spec: &LanguageSpec) -> Option<String> {
-    let body = node.child_by_field_name("body");
+    let body = spec.body_child(node);
     let form = match body {
         Some(b) => crate::normalize::canonical_form_excluding(node, b, spec),
         None => crate::normalize::canonical_form_of(node, spec),

@@ -174,7 +174,7 @@ pub fn signature_simhash(tree: &Tree, spec: &LanguageSpec) -> Option<u64> {
     let alias = spec
         .query_alias
         .and_then(|(from, to)| (node.kind() == from).then_some(to));
-    let body = node.child_by_field_name("body");
+    let body = spec.body_child(&node);
     let mut features = Vec::new();
     collect_features_alias(&node, Some(root.kind()), alias, body, &mut features);
     Some(simhash(&features))

@@ -104,8 +104,11 @@ pub struct WardConfig {
     pub suppress: Vec<String>,
     /// Number of matches returned per advisory.
     pub top_k: usize,
-    /// Enabled languages (currently only `rust` is wired; unknown entries are
-    /// accepted and ignored until their grammars are added — fail-open).
+    /// Enabled languages. All five grammars are compiled in; this list
+    /// *restricts* which of them Ward indexes and matches. Names accept
+    /// any casing (`"Kotlin"` ≡ `"kotlin"`); unknown names are ignored
+    /// with a warning — fail-open, they never error a run. Defaults to
+    /// all five.
     pub languages: Vec<String>,
     pub lint: LintConfig,
     pub sandbox: SandboxConfig,
@@ -118,7 +121,10 @@ impl Default for WardConfig {
             clusters: ClustersConfig::default(),
             suppress: Vec::new(),
             top_k: 5,
-            languages: vec!["rust".to_string()],
+            languages: crate::lang::Language::ALL
+                .iter()
+                .map(|l| l.as_str().to_string())
+                .collect(),
             lint: LintConfig::default(),
             sandbox: SandboxConfig::default(),
         }
@@ -142,6 +148,13 @@ impl WardConfig {
             },
             Err(_) => (WardConfig::default(), None),
         }
+    }
+
+    /// Is the given language enabled for indexing/matching?
+    pub fn is_language_enabled(&self, lang: crate::lang::Language) -> bool {
+        self.languages
+            .iter()
+            .any(|l| l.trim().eq_ignore_ascii_case(lang.as_str()))
     }
 
     /// Is the given (repo-relative) path suppressed?
@@ -179,7 +192,24 @@ mod tests {
         assert_eq!(cfg.thresholds.strong, 0.92);
         assert_eq!(cfg.thresholds.weak, 0.80);
         assert_eq!(cfg.top_k, 5);
-        assert_eq!(cfg.languages, vec!["rust"]);
+        assert_eq!(
+            cfg.languages,
+            vec!["rust", "kotlin", "java", "swift", "objc"],
+            "all five grammars enabled by default"
+        );
+    }
+
+    #[test]
+    fn language_gate_is_case_insensitive_and_fail_open() {
+        let cfg = WardConfig {
+            languages: vec!["Rust".into(), "Kotlin".into(), "bogus".into()],
+            ..Default::default()
+        };
+        assert!(cfg.is_language_enabled(crate::lang::Language::Rust));
+        assert!(cfg.is_language_enabled(crate::lang::Language::Kotlin));
+        assert!(!cfg.is_language_enabled(crate::lang::Language::Swift));
+        assert!(!cfg.is_language_enabled(crate::lang::Language::Java));
+        assert!(!cfg.is_language_enabled(crate::lang::Language::ObjC));
     }
 
     #[test]

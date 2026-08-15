@@ -27,7 +27,8 @@ pub struct IndexReport {
     pub files_unchanged: usize,
     pub symbols_indexed: usize,
     pub blocks_indexed: usize,
-    /// Files skipped because their language grammar is not compiled in yet
+    /// Files skipped because their language is disabled via
+    /// `.ward/config.toml` `languages` or its grammar is not compiled in
     /// (documented fail-open behavior, spec §3.0).
     pub files_skipped_language: usize,
     /// Files that failed to parse (F3: marked unparsable, everything else
@@ -148,8 +149,8 @@ fn symbol_from_node(
     let name = name_node.utf8_text(source.as_bytes()).ok()?.to_string();
     let body = node.utf8_text(source.as_bytes()).ok()?.to_string();
     let features = fingerprint::subtree_features_of(node);
-    let sig_features = node
-        .child_by_field_name("body")
+    let sig_features = spec
+        .body_child(node)
         .map(|body| fingerprint::subtree_features_excluding(node, body))
         .unwrap_or_else(|| features.clone());
     let struct_form = crate::normalize::canonical_form_of(node, spec);
@@ -288,6 +289,10 @@ impl Indexer<'_> {
             let Some(lang) = Language::from_path(&path) else {
                 continue;
             };
+            if !self.config.is_language_enabled(lang) {
+                report.files_skipped_language += 1;
+                continue;
+            }
             let Some(grammar) = lang.ts_language() else {
                 report.files_skipped_language += 1;
                 continue;

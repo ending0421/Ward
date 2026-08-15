@@ -46,6 +46,18 @@ impl Language {
         }
     }
 
+    /// Parse a language from a config / CLI / MCP name (or bare extension).
+    pub fn from_name(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "rust" | "rs" => Some(Language::Rust),
+            "kotlin" | "kt" | "kts" => Some(Language::Kotlin),
+            "swift" => Some(Language::Swift),
+            "java" => Some(Language::Java),
+            "objc" | "objective-c" | "m" | "mm" => Some(Language::ObjC),
+            _ => None,
+        }
+    }
+
     /// The tree-sitter grammar for this language, when compiled in.
     pub fn ts_language(self) -> Option<tree_sitter::Language> {
         match self {
@@ -89,6 +101,12 @@ pub struct LanguageSpec {
     pub container_kinds: &'static [&'static str],
     /// Field name holding a symbol's name (almost always "name").
     pub name_field: &'static str,
+    /// Field name holding a symbol's body, when the grammar declares one
+    /// (`None` for grammars that declare no fields on declarations —
+    /// tree-sitter-kotlin; `body_kinds` is the fallback then).
+    pub body_field: Option<&'static str>,
+    /// Body node kinds for grammars without a body field.
+    pub body_kinds: &'static [&'static str],
     /// Node kinds collapsed to `ID` during canonicalization.
     pub identifier_kinds: &'static [&'static str],
     /// Query-only kind alias: tolerant parses of signature-only snippets
@@ -126,6 +144,21 @@ impl LanguageSpec {
     pub fn is_mention_kind(&self, kind: &str) -> bool {
         self.identifier_kinds.contains(&kind)
     }
+
+    /// The symbol's body child (functions/methods), resolved by field name
+    /// first and by kind fallback for grammars that declare no fields on
+    /// declarations (tree-sitter-kotlin). `None` for body-less symbols
+    /// (structs/enums/interfaces).
+    pub fn body_child<'a>(&self, node: &'a tree_sitter::Node) -> Option<tree_sitter::Node<'a>> {
+        if let Some(field) = self.body_field {
+            if let Some(body) = node.child_by_field_name(field) {
+                return Some(body);
+            }
+        }
+        let mut cursor = node.walk();
+        node.named_children(&mut cursor)
+            .find(|c| self.body_kinds.contains(&c.kind()))
+    }
 }
 
 pub static RUST: LanguageSpec = LanguageSpec {
@@ -148,6 +181,8 @@ pub static RUST: LanguageSpec = LanguageSpec {
         "block",
     ],
     name_field: "name",
+    body_field: Some("body"),
+    body_kinds: &[],
     identifier_kinds: &[
         "identifier",
         "type_identifier",
@@ -184,6 +219,8 @@ pub static JAVA: LanguageSpec = LanguageSpec {
         "block",
     ],
     name_field: "name",
+    body_field: Some("body"),
+    body_kinds: &[],
     identifier_kinds: &["identifier", "type_identifier", "scoped_identifier"],
     query_alias: None,
 };
@@ -200,6 +237,10 @@ pub static KOTLIN: LanguageSpec = LanguageSpec {
     ],
     container_kinds: &["source_file", "class_body", "block"],
     name_field: "name",
+    // tree-sitter-kotlin declares no fields on function_declaration, so the
+    // body is resolved by kind (see `LanguageSpec::body_child`).
+    body_field: None,
+    body_kinds: &["function_body"],
     identifier_kinds: &["simple_identifier", "type_identifier"],
     query_alias: None,
 };
@@ -224,6 +265,8 @@ pub static SWIFT: LanguageSpec = LanguageSpec {
         "declarations",
     ],
     name_field: "name",
+    body_field: Some("body"),
+    body_kinds: &[],
     identifier_kinds: &["simple_identifier", "type_identifier"],
     query_alias: None,
 };
@@ -248,6 +291,8 @@ pub static OBJC: LanguageSpec = LanguageSpec {
         "compound_statement",
     ],
     name_field: "name",
+    body_field: Some("body"),
+    body_kinds: &[],
     identifier_kinds: &["identifier", "type_identifier"],
     query_alias: None,
 };
@@ -287,6 +332,24 @@ mod tests {
     #[test]
     fn unknown_extensions_are_none() {
         assert_eq!(Language::from_path(Path::new("README.md")), None);
+    }
+
+    #[test]
+    fn names_parse_for_config_and_cli() {
+        for (input, expected) in [
+            ("rust", Language::Rust),
+            ("rs", Language::Rust),
+            ("Kotlin", Language::Kotlin),
+            ("kts", Language::Kotlin),
+            ("Swift", Language::Swift),
+            ("java", Language::Java),
+            ("Objective-C", Language::ObjC),
+            ("mm", Language::ObjC),
+        ] {
+            assert_eq!(Language::from_name(input), Some(expected), "{input}");
+        }
+        assert_eq!(Language::from_name("brainfuck"), None);
+        assert_eq!(Language::from_name(""), None);
     }
 
     #[test]
@@ -342,5 +405,31 @@ mod tests {
             RUST.query_alias,
             Some(("function_signature_item", "function_item"))
         );
+    }
+
+    #[test]
+    fn body_resolution_by_field_and_kind() {
+        // Rust declares a body field.
+        let rust_tree = crate::fingerprint::parse(Language::Rust, "fn f() { g() }").unwrap();
+        let rust_fn = rust_tree.root_node().named_child(0).unwrap();
+        let body = RUST.body_child(&rust_fn).expect("rust body field");
+        assert_eq!(body.kind(), "block");
+
+        // Kotlin declares no fields at all — the kind fallback must find
+        // function_body, otherwise signature features silently include the
+        // whole body (signature-only queries degrade below the strong band).
+        let kt_tree = crate::fingerprint::parse(Language::Kotlin, "fun f() { g() }").unwrap();
+        let kt_fn = kt_tree.root_node().named_child(0).unwrap();
+        let body = KOTLIN
+            .body_child(&kt_fn)
+            .expect("kotlin body kind fallback");
+        assert_eq!(body.kind(), "function_body");
+
+        // Body-less symbols (type aliases) have no body child. (Structs DO
+        // carry a `body` field in tree-sitter-rust — the field_declaration
+        // list — so `body_child` intentionally resolves for them too.)
+        let alias_tree = crate::fingerprint::parse(Language::Rust, "type P = u8;").unwrap();
+        let alias_node = alias_tree.root_node().named_child(0).unwrap();
+        assert!(RUST.body_child(&alias_node).is_none());
     }
 }
