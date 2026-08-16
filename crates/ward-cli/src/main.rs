@@ -166,6 +166,10 @@ enum Cmd {
     CompatCheck {
         #[arg(long, default_value = "HEAD^")]
         base: String,
+        /// FFI export-face adjudication (0.5-3): declared header vs nm on
+        /// the built artifact; removed symbols are breaking.
+        #[arg(long)]
+        ffi: bool,
         #[arg(default_value = ".", long)]
         repo: PathBuf,
         #[arg(long)]
@@ -566,7 +570,7 @@ fn main() -> Result<()> {
             let base = base.unwrap_or_else(|| "HEAD^".to_string());
             // Outer-loop posture: adjudicate api_compat with the real tool.
             let results = if ci {
-                spec::evaluate_ci(&repo, &parsed, &base, &head)?
+                spec::evaluate_ci(&repo, &parsed, &base, &head, &cfg)?
             } else {
                 spec::evaluate(&repo, &parsed, &base, &head)?
             };
@@ -613,7 +617,40 @@ fn main() -> Result<()> {
             }
             let _ = cfg;
         }
-        Cmd::CompatCheck { base, repo, json } => {
+        Cmd::CompatCheck {
+            base,
+            ffi,
+            repo,
+            json,
+        } => {
+            let cfg = load_config(&repo);
+            if ffi {
+                let report = ward_core::ffi::ffi_check(&repo, &cfg.ffi);
+                if json {
+                    print_json(&report)?;
+                } else {
+                    println!(
+                        "ffi-check [{}] {} — {}",
+                        report.verdict.as_str(),
+                        report.manifest_path.as_deref().unwrap_or("(no manifest)"),
+                        report.detail
+                    );
+                    for r in &report.removed {
+                        println!("  removed  {r}");
+                    }
+                    for a in &report.added {
+                        println!("  added    {a}");
+                    }
+                }
+                // Outer loop: unknown is never green (P7).
+                if report.verdict == ward_core::compat::CompatVerdict::Fail {
+                    std::process::exit(1);
+                }
+                if report.verdict == ward_core::compat::CompatVerdict::Unknown {
+                    std::process::exit(2);
+                }
+                return Ok(());
+            }
             let report = ward_core::compat::api_compat_check(&repo, &base);
             if json {
                 print_json(&report)?;

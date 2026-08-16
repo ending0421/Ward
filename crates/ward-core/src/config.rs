@@ -76,6 +76,28 @@ impl Default for SandboxConfig {
     }
 }
 
+/// FFI export-face options (0.5-3): the expected export face (a checked-in
+/// declaration header) and the built artifact to inspect.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FfiConfig {
+    /// Repo-relative path to the checked-in C declaration header. Empty =
+    /// auto-detect headers under ffi//include/.
+    pub manifest: Option<String>,
+    /// File-name glob for the built artifact (`target/*/lib*.so`). Empty =
+    /// no artifact search → honest unknown.
+    pub artifact_glob: String,
+}
+
+impl Default for FfiConfig {
+    fn default() -> Self {
+        Self {
+            manifest: None,
+            artifact_glob: "target/*/lib*.so".into(),
+        }
+    }
+}
+
 /// Duplicate-clustering options (M6).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -112,6 +134,7 @@ pub struct WardConfig {
     pub languages: Vec<String>,
     pub lint: LintConfig,
     pub sandbox: SandboxConfig,
+    pub ffi: FfiConfig,
 }
 
 impl Default for WardConfig {
@@ -127,6 +150,7 @@ impl Default for WardConfig {
                 .collect(),
             lint: LintConfig::default(),
             sandbox: SandboxConfig::default(),
+            ffi: FfiConfig::default(),
         }
     }
 }

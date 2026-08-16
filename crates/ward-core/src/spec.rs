@@ -11,6 +11,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::config::WardConfig;
 use crate::git;
 
 /// One machine-checkable assertion from a spec file.
@@ -175,6 +176,7 @@ pub fn evaluate_ci(
     spec: &Spec,
     base: &str,
     head: &str,
+    config: &WardConfig,
 ) -> Result<Vec<AssertionResult>> {
     let mut results = evaluate(repo, spec, base, head)?;
     for r in &mut results {
@@ -186,6 +188,15 @@ pub fn evaluate_ci(
                 crate::compat::CompatVerdict::Unknown => Verdict::Unknown,
             };
             r.detail = format!("{} [{}]", report.detail, report.tool);
+        }
+        if r.assertion == "ffi_compat" && r.verdict == Verdict::Unknown {
+            let report = crate::ffi::ffi_check(repo, &config.ffi);
+            r.verdict = match report.verdict {
+                crate::compat::CompatVerdict::Pass => Verdict::Pass,
+                crate::compat::CompatVerdict::Fail => Verdict::Fail,
+                crate::compat::CompatVerdict::Unknown => Verdict::Unknown,
+            };
+            r.detail = report.detail.clone();
         }
     }
     Ok(results)
@@ -250,6 +261,11 @@ fn evaluate_one(
             assertion: a.kind.clone(),
             verdict: Verdict::Unknown,
             detail: "类型/二进制级判定需 CI 外环（逐语言工具，spec §3-M4）".to_string(),
+        },
+        "ffi_compat" => AssertionResult {
+            assertion: a.kind.clone(),
+            verdict: Verdict::Unknown,
+            detail: "FFI 导出面判定需 CI 外环（nm 对比构建产物，0.5-3）".to_string(),
         },
         other => AssertionResult {
             assertion: other.to_string(),

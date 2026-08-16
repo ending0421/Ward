@@ -14,6 +14,7 @@ pub mod diff;
 pub mod doctor;
 pub mod embedding;
 pub mod envelope;
+pub mod ffi;
 pub mod fingerprint;
 pub mod fresh;
 pub mod git;
