@@ -71,6 +71,102 @@ jobs:
       - name: Form-check the active task spec (fail-closed; api_compat adjudicated here)
         run: ./target/release/ward form-check --repo . --spec specs/2026-08-gov-data.md --ci
 
+  jvm-smoke:
+    name: jvm smoke (real binary-compatibility-validator via gradlew apiCheck)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+      - uses: gradle/actions/setup-gradle@v4
+      - name: Build ward
+        run: cargo build --release -p ward-cli
+      - name: Kotlin fixture — validator adjudication end to end
+        run: |
+          set -euo pipefail
+          WARD="$(pwd)/target/release/ward"
+          TMP="$(mktemp -d)"
+          cd "$TMP"
+          git init -q .
+          git config user.email t@t
+          git config user.name t
+          cat > settings.gradle.kts <<KEOF
+          rootProject.name = "calcapp"
+          KEOF
+          cat > build.gradle.kts <<KEOF
+          plugins {
+              kotlin("jvm") version "2.0.21"
+              id("org.jetbrains.kotlinx.binary-compatibility-validator") version "0.16.3"
+          }
+          repositories { mavenCentral() }
+          KEOF
+          mkdir -p src/main/kotlin
+          cat > src/main/kotlin/Calc.kt <<KEOF
+          package calc
+          class Calculator {
+              fun add(a: Int, b: Int): Int = a + b
+          }
+          KEOF
+          gradle wrapper --gradle-version 8.10
+          git add -A && git commit -qm base
+          ./gradlew apiDump -q >/dev/null 2>&1
+          git add -A && git commit -qm dumps
+          echo "== validator: dumps match (expect pass) =="
+          "$WARD" compat-check --repo . --base HEAD^ && echo "jvm validator pass OK"
+          echo "jvm smoke OK"
+
+  apple-smoke:
+    name: apple smoke (swift-api-digester + swift build on macOS runner)
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build ward
+        run: cargo build --release -p ward-cli
+      - name: SwiftPM fixture — digester pass + swift build M3 form
+        run: |
+          set -euo pipefail
+          WARD="$(pwd)/target/release/ward"
+          TMP="$(mktemp -d)"
+          cd "$TMP"
+          git init -q .
+          git config user.email t@t
+          git config user.name t
+          mkdir -p Sources/CalcKit
+          cat > Package.swift <<SWIFTEOF
+          // swift-tools-version:5.9
+          import PackageDescription
+          let package = Package(
+              name: "CalcKit",
+              targets: [.target(name: "CalcKit")]
+          )
+          SWIFTEOF
+          cat > Sources/CalcKit/Calc.swift <<SWIFTEOF
+          public struct Calculator {
+              public init() {}
+              public func add(_ a: Int, _ b: Int) -> Int { a + b }
+          }
+          SWIFTEOF
+          git add -A && git commit -qm base
+          cat > Sources/CalcKit/Calc.swift <<SWIFTEOF
+          public struct Calculator {
+              public init() {}
+              public func add(_ a: Int, _ b: Int) -> Int { a + b }
+              public func describe() -> String { "calc" }
+          }
+          SWIFTEOF
+          git add -A && git commit -qm head
+          echo "== digester compatible change (expect pass) =="
+          "$WARD" compat-check --repo . --base HEAD^ && echo "pass OK"
+          echo "== swift build (M3 native form) =="
+          swift build -c release
+          echo "apple smoke OK"
+
   meaningful-smoke:
     name: meaningfulness harness (recall/precision + adversarial semantics)
     runs-on: ubuntu-latest
