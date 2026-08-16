@@ -558,6 +558,28 @@ mod tests {
     }
 
     #[test]
+    fn swift_module_name_parses_package_swift() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Package.swift"),
+            "import PackageDescription\nlet package = Package(name: \"CalcKit\", targets: [.target(name: \"CalcKit\")])\n",
+        )
+        .unwrap();
+        assert_eq!(swift_module_name(dir.path()).as_deref(), Some("CalcKit"));
+        std::fs::write(dir.path().join("Package.swift"), "// nothing").unwrap();
+        assert_eq!(swift_module_name(dir.path()), None);
+    }
+
+    #[test]
+    fn gradle_without_gradlew_is_unknown() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("build.gradle.kts"), "// no wrapper\n").unwrap();
+        let r = gradle_api_check_with("./gradlew", dir.path());
+        assert_eq!(r.verdict, CompatVerdict::Unknown);
+        assert!(r.detail.contains("gradlew"), "{}", r.detail);
+    }
+
+    #[test]
     fn maven_without_jars_is_unknown() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("pom.xml"), "<project/>").unwrap();

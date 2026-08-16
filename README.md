@@ -117,6 +117,10 @@ timeout_secs = 120
 verify_command = "cargo test --quiet"
 image = "rust:1-bookworm"
 memory = "2g"
+
+[ffi]                   # FFI export-face adjudication (compat-check --ffi)
+manifest = "ffi/exports.h"      # checked-in C declaration header
+artifact_glob = "target/*/release/lib*.so"
 ```
 
 ### Connect as an MCP server (Claude Code)
@@ -261,7 +265,8 @@ specs/         # active task specs (form-check gate input)
 scripts/       # install.sh, verify-meaningful.sh, gen-release-notes.sh
 .github/       # CI: reusable quality gate, spec gate, 5-target release pipeline
 docs/          # design spec (v0.6.1), usage guide, acceptance criteria,
-               # curated release notes, metrics baseline
+               # curated release notes, metrics baseline, F11 benchmarks,
+               # main-repo smoke runbook
 ```
 
 ## Design principles (the seven iron laws)

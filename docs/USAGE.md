@@ -111,6 +111,15 @@ assertions:
     ward form-check --spec specs/$SPEC --ci          # 失败=1，未知=2
     ward verify --full --repo . || exit $?           # 沙箱真跑测试（无沙箱=2）
     ward compat-check --base main --repo . || exit $? # API 兼容（无工具=2）
+    ward compat-check --base main --repo . --ffi || exit $? # FFI 导出面（0.5-3）
+```
+
+多平台 monorepo 的**模块级裁决**：在模块目录内执行
+（`ward compat-check --repo android` 走 gradlew apiCheck；
+`ward compat-check --repo ios` 走 swift-api-digester；根目录走 Rust +
+FFI）。spec 断言加 `- kind: ffi_compat` 后，`form-check --ci` 会用 nm
+对比导出面清单，removed 符号 = 红。UDL（.udl）变更由 replay 报
+HIGH 风险标记：绑定是生成物，必须重新生成并人审。
 ```
 
 退出码约定：`1` = 裁决失败（红），`2` = 证据不足（unknown 不绿灯，也是红）。

@@ -381,6 +381,60 @@ static void helper(void);
     }
 
     #[test]
+    fn auto_detects_manifest_when_config_is_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(repo.join("include")).unwrap();
+        std::fs::write(repo.join("include/exports.h"), "int foo(int x);\n").unwrap();
+        let cfg = FfiConfig {
+            manifest: None,
+            artifact_glob: String::new(),
+        };
+        let r = ffi_check_with("nm", &repo, &cfg);
+        // Manifest resolved (auto-detect), artifact absent → unknown with
+        // the expected face populated.
+        assert_eq!(r.verdict, CompatVerdict::Unknown);
+        assert!(r.manifest_path.is_some(), "{r:?}");
+        assert_eq!(r.expected, vec!["foo".to_string()]);
+        assert!(r.detail.contains("未找到构建产物"), "{}", r.detail);
+    }
+
+    #[test]
+    fn nm_failure_is_unknown() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(repo.join("ffi")).unwrap();
+        std::fs::create_dir_all(repo.join("target/release")).unwrap();
+        std::fs::write(repo.join("ffi/exports.h"), "int foo(int x);\n").unwrap();
+        std::fs::write(repo.join("target/release/libx.so"), "artifact").unwrap();
+        let shim = dir.path().join("nm");
+        std::fs::write(&shim, "#!/bin/sh\necho nope >&2\nexit 1\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let cfg = FfiConfig::default();
+        let r = ffi_check_with(shim.to_str().unwrap(), &repo, &cfg);
+        assert_eq!(r.verdict, CompatVerdict::Unknown);
+    }
+
+    #[test]
+    fn glob_matches_paths_across_directories() {
+        assert!(glob_like(
+            "target/*/lib*.so",
+            "target/aarch64-apple-ios/release/libcalc.so"
+        ));
+        assert!(glob_like("target/*/lib*.so", "target/release/libcalc.so"));
+        assert!(!glob_like(
+            "target/*/lib*.so",
+            "target/release/libcalc.dylib"
+        ));
+        assert!(glob_like("lib?.a", "libx.a"));
+        assert!(!glob_like("lib?.a", "libxy.a"));
+    }
+
+    #[test]
     fn missing_manifest_or_artifact_is_unknown() {
         let dir = tempfile::tempdir().unwrap();
         let cfg = FfiConfig::default();
