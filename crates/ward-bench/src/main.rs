@@ -217,6 +217,7 @@ pub fn run_bench(repo: &Path, queries: usize) -> Result<BenchReport> {
             Some(&sig),
             None,
             lang,
+            None,
         )?;
         lat_ms.push(t.elapsed().as_secs_f64() * 1000.0);
     }

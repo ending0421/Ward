@@ -117,15 +117,23 @@ fn tail(s: &str, lines: usize) -> String {
 /// Inner-loop precheck: run the configured lint command (no Docker).
 pub fn catch_run(repo: &Path, config: &WardConfig) -> CatchReport {
     let start = Instant::now();
-    if config.lint.command.trim().is_empty() {
+    // Shipped-default slot auto-selects the language form (spec §3.0 M3):
+    // Cargo → cargo check, Gradle → classes, SwiftPM → swift build.
+    // An explicit config value always wins; undetectable kinds defer.
+    let effective_command = if config.lint.command == crate::project::DEFAULT_LINT_RUST {
+        crate::project::default_lint(crate::project::detect(repo))
+    } else {
+        config.lint.command.as_str()
+    };
+    if effective_command.is_empty() {
         return CatchReport {
             verdict: CatchVerdict::Deferred,
-            note: "未配置内环预检命令（.ward/config.toml → lint.command）".into(),
+            note: "该构建系统无确定性内环预检（或未配置 lint.command）".into(),
             output_tail: String::new(),
             duration_ms: start.elapsed().as_millis() as u64,
         };
     }
-    let mut parts = config.lint.command.split_whitespace();
+    let mut parts = effective_command.split_whitespace();
     let Some(prog) = parts.next() else {
         return CatchReport {
             verdict: CatchVerdict::Unknown,
@@ -174,21 +182,21 @@ pub fn catch_run(repo: &Path, config: &WardConfig) -> CatchReport {
 /// Map a sandbox run's raw outcome to a CatchReport (pure, testable).
 fn outer_report(
     ok: bool,
-    config: &WardConfig,
+    verify_command: &str,
     output_tail: String,
     duration_ms: u64,
 ) -> CatchReport {
     if ok {
         CatchReport {
             verdict: CatchVerdict::Pass,
-            note: format!("外环沙箱裁决通过：{}", config.sandbox.verify_command),
+            note: format!("外环沙箱裁决通过：{verify_command}"),
             output_tail,
             duration_ms,
         }
     } else {
         CatchReport {
             verdict: CatchVerdict::Fail,
-            note: format!("外环沙箱裁决失败：{}", config.sandbox.verify_command),
+            note: format!("外环沙箱裁决失败：{verify_command}"),
             output_tail,
             duration_ms,
         }
@@ -235,6 +243,18 @@ pub fn sandbox_args_with_cache(
     repo_abs: &str,
     cargo_cache: Option<&str>,
 ) -> Vec<String> {
+    sandbox_args_overridden(config, repo_abs, cargo_cache, None, None)
+}
+
+/// [`sandbox_args_with_cache`] with explicit image/verify-command overrides
+/// (auto-detected language forms, spec §3.0 M3).
+pub fn sandbox_args_overridden(
+    config: &WardConfig,
+    repo_abs: &str,
+    cargo_cache: Option<&str>,
+    image: Option<&str>,
+    verify_command: Option<&str>,
+) -> Vec<String> {
     let mut args = vec![
         "run".to_string(),
         "--rm".to_string(),
@@ -262,10 +282,12 @@ pub fn sandbox_args_with_cache(
         args.push(format!("{cache}:/tmp/ward-cargo:ro"));
     }
     args.extend([
-        config.sandbox.image.clone(),
+        image.unwrap_or(&config.sandbox.image).to_string(),
         "sh".to_string(),
         "-c".to_string(),
-        config.sandbox.verify_command.clone(),
+        verify_command
+            .unwrap_or(&config.sandbox.verify_command)
+            .to_string(),
     ]);
     args
 }
@@ -283,6 +305,29 @@ pub fn verify_full(repo: &Path, config: &WardConfig) -> CatchReport {
 /// no environment mutation, parallel-test safe).
 pub fn run_sandbox(docker_bin: &str, repo: &Path, config: &WardConfig) -> CatchReport {
     let start = Instant::now();
+    // Shipped-default slot auto-selects the language form (spec §3.0 M3):
+    // explicit config wins; undetectable kinds honestly report unknown.
+    let (verify_command, image) = if config.sandbox.verify_command
+        == crate::project::DEFAULT_VERIFY_RUST
+        && config.sandbox.image == crate::project::DEFAULT_IMAGE_RUST
+    {
+        let (cmd, img) = crate::project::default_verify(crate::project::detect(repo));
+        if cmd.is_empty() {
+            return CatchReport {
+                verdict: CatchVerdict::Unknown,
+                note: "该构建系统无确定性 Docker 沙箱形态（如 Xcode）；仅对应 runner 可裁决（F13）"
+                    .into(),
+                output_tail: String::new(),
+                duration_ms: start.elapsed().as_millis() as u64,
+            };
+        }
+        (cmd.to_string(), img.to_string())
+    } else {
+        (
+            config.sandbox.verify_command.clone(),
+            config.sandbox.image.clone(),
+        )
+    };
     if !docker_available(docker_bin) {
         return CatchReport {
             verdict: CatchVerdict::Unknown,
@@ -310,7 +355,13 @@ pub fn run_sandbox(docker_bin: &str, repo: &Path, config: &WardConfig) -> CatchR
         .is_dir()
         .then(|| repo_abs.join(".cargo").to_string_lossy().into_owned());
     let mut cmd = Command::new(docker_bin);
-    cmd.args(sandbox_args_with_cache(config, &repo_str, cache.as_deref()));
+    cmd.args(sandbox_args_overridden(
+        config,
+        &repo_str,
+        cache.as_deref(),
+        Some(&image),
+        Some(&verify_command),
+    ));
     let (ok, stdout, stderr) = run_with_timeout(&mut cmd, Duration::from_secs(1800));
     let combined = format!("{stdout}\n{stderr}");
     let output_tail = tail(&combined, 24);
@@ -327,7 +378,7 @@ pub fn run_sandbox(docker_bin: &str, repo: &Path, config: &WardConfig) -> CatchR
             duration_ms,
         };
     }
-    outer_report(ok, config, output_tail, duration_ms)
+    outer_report(ok, &verify_command, output_tail, duration_ms)
 }
 
 #[cfg(test)]
@@ -352,9 +403,9 @@ mod tests {
     #[test]
     fn outer_report_maps_outcomes() {
         let cfg = WardConfig::default();
-        let pass = outer_report(true, &cfg, "x".into(), 1);
+        let pass = outer_report(true, "cargo test --quiet", "x".into(), 1);
         assert_eq!(pass.verdict, CatchVerdict::Pass);
-        let fail = outer_report(false, &cfg, "x".into(), 1);
+        let fail = outer_report(false, "cargo test --quiet", "x".into(), 1);
         assert_eq!(fail.verdict, CatchVerdict::Fail);
         assert!(fail.note.contains("cargo test"));
     }
@@ -383,6 +434,7 @@ mod tests {
     fn docker_shim_covers_pass_fail_and_security_args() {
         let dir = tempfile::tempdir().unwrap();
         let repo = tempfile::tempdir().unwrap();
+        std::fs::write(repo.path().join("Cargo.toml"), "[package]\nname=\"x\"\n").unwrap();
         let log = dir.path().join("args.log");
         let log_s = log.to_string_lossy().into_owned();
         let script = format!(
@@ -443,6 +495,7 @@ mod tests {
     fn docker_client_without_daemon_is_unknown_not_fail() {
         let dir = tempfile::tempdir().unwrap();
         let repo = tempfile::tempdir().unwrap();
+        std::fs::write(repo.path().join("Cargo.toml"), "[package]\nname=\"x\"\n").unwrap();
         let cfg = WardConfig::default();
         // Shim: `info` renders nothing (daemon down), `run` emits the
         // daemon-unreachable error. The verdict must be Unknown (F13), and

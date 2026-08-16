@@ -96,6 +96,7 @@ pub fn doctor(repo: &Path, opts: &DoctorOpts) -> Result<DoctorReport> {
             Some("pub fn __ward_probe__() -> u8"),
             None,
             None,
+            None,
         );
         spot_ms.push(t.elapsed().as_secs_f64() * 1000.0);
     }

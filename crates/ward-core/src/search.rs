@@ -26,6 +26,10 @@ use crate::store::{Advisory, Store, Symbol};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SpotMatch {
     pub path: String,
+    /// Monorepo scope of the hit (spec §2.6); empty unless a scope filter
+    /// was supplied. Legacy payloads deserialize to empty.
+    #[serde(default)]
+    pub scope: String,
     /// 1-based inclusive line range, `"start-end"`.
     pub lines: String,
     pub symbol: String,
@@ -257,6 +261,11 @@ pub fn parse_query_language(
 }
 
 /// Run the full Spot pipeline and record the advisory.
+//
+// The argument list is the query surface (intent/signature/body/language/
+// scope) plus its context (repo/store/config) — a struct would only move
+// the verbosity around.
+#[allow(clippy::too_many_arguments)]
 pub fn spot(
     repo: &Path,
     store: &Store,
@@ -265,6 +274,7 @@ pub fn spot(
     proposed_signature: Option<&str>,
     proposed_body: Option<&str>,
     language: Option<Language>,
+    scope: Option<&str>,
 ) -> Result<SpotResult> {
     let symbols = store.all_symbols()?;
     let bm25 = store.bm25()?;
@@ -293,6 +303,10 @@ pub fn spot(
         .as_ref()
         .and_then(|(lang, t)| fingerprint::signature_simhash(t, lang.spec()));
 
+    // Monorepo scope filter (spec §2.6): when the caller names a scope,
+    // cross-scope hits are excluded — a Kotlin wrapper and the Rust core
+    // must never fingerprint-match each other.
+    let in_scope = |module: &str| scope.is_none_or(|s| module == s);
     if let Some(qs) = &query_struct {
         // Cap at top_k BEFORE materializing: each push reads the hit file
         // for its line range, and a big L1 cluster (literal-variant family)
@@ -300,6 +314,7 @@ pub fn spot(
         for sym in symbols
             .iter()
             .filter(|s| &s.struct_hash == qs)
+            .filter(|s| in_scope(&s.module))
             .filter(|s| !config.is_suppressed(&s.file_path))
         {
             if matches.len() >= config.top_k {
@@ -307,6 +322,7 @@ pub fn spot(
             }
             matches.push(SpotMatch {
                 path: sym.file_path.clone(),
+                scope: sym.module.clone(),
                 lines: line_range(&repo.join(&sym.file_path), sym.start_byte, sym.end_byte),
                 symbol: sym.name.clone(),
                 similarity: 1.0,
@@ -345,7 +361,7 @@ pub fn spot(
                     break;
                 }
                 let sym = &symbols[idx];
-                if config.is_suppressed(&sym.file_path) {
+                if !in_scope(&sym.module) || config.is_suppressed(&sym.file_path) {
                     continue;
                 }
                 if !claimed.insert((sym.file_path.clone(), sym.name.clone())) {
@@ -354,6 +370,7 @@ pub fn spot(
                 ranked.push((
                     SpotMatch {
                         path: sym.file_path.clone(),
+                        scope: sym.module.clone(),
                         lines: line_range(&repo.join(&sym.file_path), sym.start_byte, sym.end_byte),
                         symbol: sym.name.clone(),
                         similarity: sim,
@@ -373,7 +390,7 @@ pub fn spot(
             let candidates = bm25.recall(&query, 50);
             for (idx, bm25_score) in candidates {
                 let sym = &symbols[idx];
-                if config.is_suppressed(&sym.file_path) {
+                if !in_scope(&sym.module) || config.is_suppressed(&sym.file_path) {
                     continue;
                 }
                 if !claimed.insert((sym.file_path.clone(), sym.name.clone())) {
@@ -393,6 +410,7 @@ pub fn spot(
                     ranked.push((
                         SpotMatch {
                             path: sym.file_path.clone(),
+                            scope: sym.module.clone(),
                             lines: line_range(
                                 &repo.join(&sym.file_path),
                                 sym.start_byte,
@@ -440,6 +458,7 @@ pub fn spot(
                     block_hits.push((
                         SpotMatch {
                             path: b.file_path.clone(),
+                            scope: String::new(),
                             lines: line_range(&repo.join(&b.file_path), b.start_byte, b.end_byte),
                             symbol: format!("block:{}", b.kind),
                             similarity: best,
@@ -554,6 +573,7 @@ mod tests {
             Symbol {
                 id: None,
                 file_path: "a.rs".into(),
+                module: String::new(),
                 language: "rust".into(),
                 name: "debounce".into(),
                 kind: "function_item".into(),
@@ -569,6 +589,7 @@ mod tests {
             Symbol {
                 id: None,
                 file_path: "b.rs".into(),
+                module: String::new(),
                 language: "rust".into(),
                 name: "quicksort".into(),
                 kind: "function_item".into(),

@@ -224,6 +224,7 @@ mod tests {
         let symbols = vec![crate::store::Symbol {
             id: None,
             file_path: "src/lib.rs".into(),
+            module: String::new(),
             language: "rust".into(),
             name: "debounce".into(),
             kind: "function_item".into(),

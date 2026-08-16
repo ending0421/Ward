@@ -7,7 +7,7 @@
 //! (spec §3-M1, granularity-mismatch fix) are extracted as sliding windows
 //! over statement children of block nodes.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -159,6 +159,7 @@ fn symbol_from_node(
     Some(Symbol {
         id: None,
         file_path: String::new(), // filled in by the caller
+        module: String::new(),
         language: spec.lang.as_str().to_string(),
         name,
         kind: node.kind().to_string(),
@@ -259,6 +260,75 @@ pub fn block_windows_of_body(body: &str) -> Vec<u64> {
     blocks.into_iter().map(|b| b.simhash).collect()
 }
 
+/// Monorepo scope for a repo-relative path (spec §2.6): the nearest
+/// package/module boundary (Cargo package name, Gradle module dir, SwiftPM
+/// package dir), falling back to the repo-relative top-level directory.
+/// The result is memoized per directory.
+fn module_of(repo_root: &Path, rel: &str, cache: &mut HashMap<PathBuf, Option<String>>) -> String {
+    let dir = Path::new(rel).parent().unwrap_or_else(|| Path::new(""));
+    let mut cur = Some(dir.to_path_buf());
+    while let Some(d) = cur {
+        if let Some(hit) = cache.get(&d) {
+            return hit.clone().unwrap_or_default();
+        }
+        let abs = repo_root.join(&d);
+        let found = manifest_boundary(&abs, &d);
+        cache.insert(d.clone(), found.clone());
+        if let Some(f) = found {
+            return f;
+        }
+        cur = d.parent().map(|p| p.to_path_buf());
+    }
+    // Fallback: the repo-relative top-level directory of the file.
+    let mut components = Path::new(rel).components();
+    match (components.next(), components.next()) {
+        (Some(first), Some(_)) => first.as_os_str().to_string_lossy().into_owned(),
+        _ => String::new(),
+    }
+}
+
+/// The package/module boundary this directory declares, if any.
+fn manifest_boundary(abs_dir: &Path, rel_dir: &Path) -> Option<String> {
+    if abs_dir.join("Cargo.toml").is_file() {
+        let name = std::fs::read_to_string(abs_dir.join("Cargo.toml"))
+            .ok()
+            .and_then(|raw| toml::from_str::<toml::Value>(&raw).ok())
+            .and_then(|v| {
+                v.get("package")
+                    .and_then(|p| p.get("name"))
+                    .and_then(|n| n.as_str())
+                    .map(String::from)
+            });
+        return Some(name.unwrap_or_else(|| dir_label(rel_dir)));
+    }
+    for m in [
+        "build.gradle.kts",
+        "build.gradle",
+        "settings.gradle.kts",
+        "settings.gradle",
+        "Package.swift",
+    ] {
+        if abs_dir.join(m).is_file() {
+            return Some(dir_label(rel_dir));
+        }
+    }
+    None
+}
+
+fn dir_label(rel_dir: &Path) -> String {
+    rel_dir
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "root".to_string())
+}
+
+/// Convenience: the monorepo scope of one repo-relative path (spec §2.6).
+pub fn module_of_path(repo_root: &Path, rel: &str) -> String {
+    let mut cache = HashMap::new();
+    module_of(repo_root, rel, &mut cache)
+}
+
 /// Repository-wide indexer.
 pub struct Indexer<'a> {
     pub repo_root: &'a Path,
@@ -276,6 +346,7 @@ impl Indexer<'_> {
         let sha = commit.unwrap_or_else(|| "uncommitted".to_string());
 
         let files = self.collect_files()?;
+        let mut module_cache: HashMap<PathBuf, Option<String>> = HashMap::new();
         for path in files {
             let rel = path
                 .strip_prefix(self.repo_root)
@@ -340,10 +411,12 @@ impl Indexer<'_> {
                     e.symbol.in_test = true;
                 }
             }
+            let module = module_of(self.repo_root, &rel, &mut module_cache);
             let mut symbols: Vec<Symbol> = Vec::with_capacity(extracted.len());
             for e in &extracted {
                 let mut sym = e.symbol.clone();
                 sym.file_path = rel.clone();
+                sym.module = module.clone();
                 sym.commit_sha = sha.clone();
                 symbols.push(sym);
             }
@@ -404,13 +477,33 @@ impl Indexer<'_> {
                 let path = entry.path();
                 let name = entry.file_name();
                 let name = name.to_string_lossy();
-                // Skip VCS/artifact/workspace dot-directories. Hidden dirs
-                // in general carry no first-party source (.git, .cargo,
-                // .ward, .github, …).
-                if name.starts_with('.') || name == "target" || name == "node_modules" {
+                let Ok(meta) = entry.metadata() else { continue };
+                // VCS/artifact/workspace dirs: hidden dirs generally, Rust
+                // target/, Gradle build/ + .gradle/, Xcode DerivedData/,
+                // SwiftPM .build/, JS node_modules/ (spec §2.6 hygiene).
+                if name.starts_with('.')
+                    || matches!(
+                        name.as_ref(),
+                        "target" | "build" | "DerivedData" | "node_modules"
+                    )
+                {
                     continue;
                 }
-                let Ok(meta) = entry.metadata() else { continue };
+                // Build manifests are NOT source, even when their extension
+                // collides with a language (build.gradle.kts → Kotlin,
+                // Package.swift → Swift).
+                if meta.is_file()
+                    && matches!(
+                        name.as_ref(),
+                        "build.gradle"
+                            | "build.gradle.kts"
+                            | "settings.gradle"
+                            | "settings.gradle.kts"
+                            | "Package.swift"
+                    )
+                {
+                    continue;
+                }
                 if meta.is_dir() {
                     stack.push(path);
                 } else if meta.is_file() {

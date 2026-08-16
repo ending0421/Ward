@@ -43,6 +43,9 @@ pub struct SpotParams {
     /// Signature language override ("rust|kotlin|swift|java|objc");
     /// auto-detected from the snippet when omitted.
     pub language: Option<String>,
+    /// Monorepo scope filter (spec §2.6): only return hits from this
+    /// package/module.
+    pub scope: Option<String>,
     /// Repository root; defaults to the daemon's working directory.
     pub repo: Option<String>,
     /// Number of matches to return.
@@ -157,6 +160,7 @@ impl WardMcp {
                 p.proposed_signature.as_deref(),
                 p.proposed_body.as_deref(),
                 lang,
+                p.scope.as_deref(),
             )
         })();
         match result {

@@ -52,6 +52,18 @@ pub fn spot_new_symbols(
     config: &WardConfig,
     path: &str,
 ) -> Result<FileSpotReport> {
+    spot_new_symbols_scoped(repo, store, config, path, None)
+}
+
+/// [`spot_new_symbols`] with a monorepo scope filter (spec §2.6): queries
+/// are constrained to the written file's package/module.
+pub fn spot_new_symbols_scoped(
+    repo: &Path,
+    store: &Store,
+    config: &WardConfig,
+    path: &str,
+    scope: Option<&str>,
+) -> Result<FileSpotReport> {
     let full = repo.join(path);
     let Some(lang) = Language::from_path(&full) else {
         return Ok(FileSpotReport::empty(path)); // not a source file
@@ -92,7 +104,16 @@ pub fn spot_new_symbols(
             .unwrap_or("")
             .to_string();
         let intent = format!("新增/变更符号 {}（{}）", e.symbol.name, path);
-        let result = search::spot(repo, store, config, &intent, Some(&sig), None, Some(lang))?;
+        let result = search::spot(
+            repo,
+            store,
+            config,
+            &intent,
+            Some(&sig),
+            None,
+            Some(lang),
+            scope,
+        )?;
         advisories.push(result);
     }
     Ok(FileSpotReport {

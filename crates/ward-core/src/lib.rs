@@ -25,6 +25,7 @@ pub mod lang;
 pub mod llm;
 pub mod narrate;
 pub mod normalize;
+pub mod project;
 pub mod report;
 pub mod search;
 pub mod spec;

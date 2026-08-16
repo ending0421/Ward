@@ -214,6 +214,7 @@ mod tests {
         crate::store::Symbol {
             id: None,
             file_path: path.into(),
+            module: String::new(),
             language: "rust".into(),
             name: name.into(),
             kind: "function_item".into(),

@@ -10,13 +10,17 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 /// Current schema version. Bump on any schema change; mismatches trigger a
 /// full rebuild instead of a migration (rebuild is cheap and always safe).
-pub const SCHEMA_VERSION: i64 = 6;
+pub const SCHEMA_VERSION: i64 = 7;
 
 /// One indexed symbol (function / struct / enum / trait / method, …).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Symbol {
     pub id: Option<i64>,
     pub file_path: String,
+    /// Monorepo scope (spec §2.6): the package/module boundary this symbol
+    /// belongs to (Cargo package name, Gradle module dir, SwiftPM package
+    /// dir, or the repo-root-relative top-level dir). Empty when unknown.
+    pub module: String,
     pub language: String,
     pub name: String,
     pub kind: String,
@@ -141,6 +145,7 @@ fn create_schema(conn: &Connection) -> Result<()> {
         CREATE TABLE IF NOT EXISTS symbols (
             id          INTEGER PRIMARY KEY,
             file_path   TEXT NOT NULL,
+            module      TEXT NOT NULL DEFAULT '',
             language    TEXT NOT NULL,
             name        TEXT NOT NULL,
             kind        TEXT NOT NULL,
@@ -384,11 +389,12 @@ impl Store {
         for s in symbols {
             tx.execute(
                 "INSERT INTO symbols
-                   (file_path, language, name, kind, start_byte, end_byte,
+                   (file_path, module, language, name, kind, start_byte, end_byte,
                     body_hash, struct_hash, simhash, sig_simhash, in_test, commit_sha)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
                 params![
                     s.file_path,
+                    s.module,
                     s.language,
                     s.name,
                     s.kind,
@@ -460,7 +466,7 @@ impl Store {
     /// memory by design — 10⁴–10⁵ symbols, spec §4).
     pub fn all_symbols(&self) -> Result<Vec<Symbol>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, file_path, language, name, kind, start_byte, end_byte,
+            "SELECT id, file_path, module, language, name, kind, start_byte, end_byte,
                     body_hash, struct_hash, simhash, sig_simhash, in_test, commit_sha
              FROM symbols",
         )?;
@@ -471,7 +477,7 @@ impl Store {
     /// Symbols with an exact L1 structural match.
     pub fn symbols_by_struct_hash(&self, hash: &str) -> Result<Vec<Symbol>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, file_path, language, name, kind, start_byte, end_byte,
+            "SELECT id, file_path, module, language, name, kind, start_byte, end_byte,
                     body_hash, struct_hash, simhash, sig_simhash, in_test, commit_sha
              FROM symbols WHERE struct_hash = ?1",
         )?;
@@ -989,23 +995,24 @@ impl Store {
 }
 
 fn row_to_symbol(r: &rusqlite::Row<'_>) -> rusqlite::Result<Symbol> {
-    let simhash: i64 = r.get(9)?;
-    let sig_simhash: i64 = r.get(10)?;
-    let in_test: i64 = r.get(11)?;
+    let simhash: i64 = r.get(10)?;
+    let sig_simhash: i64 = r.get(11)?;
+    let in_test: i64 = r.get(12)?;
     Ok(Symbol {
         id: r.get(0)?,
         file_path: r.get(1)?,
-        language: r.get(2)?,
-        name: r.get(3)?,
-        kind: r.get(4)?,
-        start_byte: r.get(5)?,
-        end_byte: r.get(6)?,
-        body_hash: r.get(7)?,
-        struct_hash: r.get(8)?,
+        module: r.get(2)?,
+        language: r.get(3)?,
+        name: r.get(4)?,
+        kind: r.get(5)?,
+        start_byte: r.get(6)?,
+        end_byte: r.get(7)?,
+        body_hash: r.get(8)?,
+        struct_hash: r.get(9)?,
         simhash: simhash as u64,
         sig_simhash: sig_simhash as u64,
         in_test: in_test != 0,
-        commit_sha: r.get(12)?,
+        commit_sha: r.get(13)?,
     })
 }
 
@@ -1017,6 +1024,7 @@ mod tests {
         Symbol {
             id: None,
             file_path: "src/lib.rs".into(),
+            module: String::new(),
             language: "rust".into(),
             name: name.into(),
             kind: "function_item".into(),

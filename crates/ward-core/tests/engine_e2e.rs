@@ -135,6 +135,108 @@ const MULTI_LANG_FILES: &[(&str, &str)] = &[
 ];
 
 #[test]
+fn module_scoping_partitions_symbols_and_filters_spot() {
+    let repo = TestRepo::new();
+    // A Rust core package and a Kotlin wrapper module: the same structural
+    // shape exists in both, and each must only match within its scope.
+    repo.write(
+        "core/Cargo.toml",
+        "[package]\nname = \"engine-core\"\nversion = \"0.1.0\"\n",
+    );
+    repo.write(
+        "core/src/lib.rs",
+        "pub fn push_fill_quad(rect: &Rect, color: u32) { tessellate(rect); paint(color) }\npub struct Rect { pub x: f32, pub y: f32 }\nfn tessellate(_r: &Rect) {}\nfn paint(_c: u32) {}\n",
+    );
+    repo.write("android/build.gradle.kts", "// wrapper module\n");
+    repo.write(
+        "android/src/main/kotlin/Wrapper.kt",
+        "package wrapper\n\nclass Wrapper {\n    fun pushFillQuad(rect: Rect, color: Int): Unit { tessellate(rect); paint(color) }\n}\nclass Rect(val x: Float, val y: Float)\nfun tessellate(r: Rect) {}\nfun paint(c: Int) {}\n",
+    );
+    repo.commit_all("c1");
+    let report = index::index_repo(repo.path(), &cfg()).unwrap();
+    assert_eq!(report.files_indexed, 2, "{report:?}");
+    let store = Store::open(&Store::default_path(repo.path())).unwrap();
+    let symbols = store.all_symbols().unwrap();
+    let rust_scope: Vec<&str> = symbols
+        .iter()
+        .filter(|s| s.file_path.starts_with("core/"))
+        .map(|s| s.module.as_str())
+        .collect();
+    assert!(!rust_scope.is_empty());
+    assert!(
+        rust_scope.iter().all(|m| *m == "engine-core"),
+        "cargo package name is the scope: {rust_scope:?}"
+    );
+    let kt_scope: Vec<&str> = symbols
+        .iter()
+        .filter(|s| s.file_path.starts_with("android/"))
+        .map(|s| s.module.as_str())
+        .collect();
+    assert!(!kt_scope.is_empty());
+    assert!(
+        kt_scope.iter().all(|m| *m == "android"),
+        "gradle module dir is the scope: {kt_scope:?}"
+    );
+
+    // Same-structure query: scoped to the Rust core, the Kotlin clone must
+    // not surface; unscoped it must.
+    let sig = "pub fn push_fill_quad(rect: &Rect, color: u32)";
+    let scoped = search::spot(
+        repo.path(),
+        &store,
+        &cfg(),
+        "x",
+        Some(sig),
+        None,
+        Some(Language::Rust),
+        Some("engine-core"),
+    )
+    .unwrap();
+    assert!(
+        scoped.matches.iter().all(|m| m.scope == "engine-core"),
+        "{:?}",
+        scoped.matches
+    );
+    let unscoped = search::spot(
+        repo.path(),
+        &store,
+        &cfg(),
+        "x",
+        Some(sig),
+        None,
+        Some(Language::Rust),
+        None,
+    )
+    .unwrap();
+    assert!(
+        unscoped.matches.len() >= scoped.matches.len(),
+        "scoping must only restrict: {:?} vs {:?}",
+        scoped.matches,
+        unscoped.matches
+    );
+}
+
+#[test]
+fn build_artifact_dirs_are_not_indexed() {
+    let repo = TestRepo::new();
+    repo.write("src/lib.rs", "pub fn f() {}\n");
+    repo.write("target/debug/build/x.rs", "pub fn generated() {}\n");
+    repo.write("build/generated/Gen.kt", "fun generated() {}\n");
+    repo.write(".gradle/caches/x.rs", "pub fn cached() {}\n");
+    repo.write(
+        "ios/DerivedData/Build/Generated.swift",
+        "func generated() {}\n",
+    );
+    repo.write("swift/.build/checkouts/D.swift", "func checkout() {}\n");
+    repo.commit_all("c1");
+    let report = index::index_repo(repo.path(), &cfg()).unwrap();
+    assert_eq!(
+        report.files_indexed, 1,
+        "only src/lib.rs may be indexed: {report:?}"
+    );
+}
+
+#[test]
 fn index_repo_handles_all_five_languages() {
     let repo = TestRepo::new();
     for (path, content) in MULTI_LANG_FILES {
@@ -219,6 +321,7 @@ fn spot_resolves_kotlin_signatures_structurally() {
         Some("fun debounce(f: (Long) -> Unit, ms: Long): Unit"),
         None,
         None,
+        None,
     )
     .unwrap();
     let hit = r
@@ -242,6 +345,7 @@ fn spot_resolves_kotlin_signatures_structurally() {
         Some("fun debounce(f: (Long) -> Unit, ms: Long): Unit"),
         None,
         Some(Language::Kotlin),
+        None,
     )
     .unwrap();
     assert!(r2.matches.iter().any(|m| m.symbol == "debounce"));
@@ -259,6 +363,7 @@ fn spot_resolves_kotlin_signatures_structurally() {
         &cfg(),
         "防抖函数",
         Some("fun debounce(f: (Long) -> Unit, ms: Long): Unit"),
+        None,
         None,
         None,
     )
@@ -377,6 +482,7 @@ fn spot_finds_structural_match_end_to_end() {
         Some("pub fn debounce(f: &dyn Fn(u64), ms: u64) -> u8"),
         None,
         None,
+        None,
     )
     .unwrap();
     assert!(!r.stale);
@@ -407,6 +513,7 @@ fn spot_l1_structural_equality_when_signature_is_full_body() {
         &cfg(),
         "防抖",
         Some(fn_src),
+        None,
         None,
         None,
     )
@@ -524,6 +631,7 @@ fn near_set_is_a_pure_function_of_signature_not_intent() {
         Some(sig),
         Some(body),
         Some(Language::Rust),
+        None,
     )
     .unwrap();
     let r_b = search::spot(
@@ -534,6 +642,7 @@ fn near_set_is_a_pure_function_of_signature_not_intent() {
         Some(sig),
         Some(body),
         Some(Language::Rust),
+        None,
     )
     .unwrap();
     let near_of = |r: &ward_core::search::SpotResult| -> Vec<(String, f64)> {
@@ -573,6 +682,7 @@ fn spot_block_layer_matches_body_windows() {
         None,
         Some(body),
         None,
+        None,
     )
     .unwrap();
     assert!(
@@ -589,7 +699,17 @@ fn spot_without_signature_is_weak_never_strong() {
     repo.commit_all("c1");
     index::index_repo(repo.path(), &cfg()).unwrap();
     let store = Store::open(&Store::default_path(repo.path())).unwrap();
-    let r = search::spot(repo.path(), &store, &cfg(), "debounce", None, None, None).unwrap();
+    let r = search::spot(
+        repo.path(),
+        &store,
+        &cfg(),
+        "debounce",
+        None,
+        None,
+        None,
+        None,
+    )
+    .unwrap();
     for m in &r.matches {
         assert_ne!(m.kind, "structural");
         assert_ne!(m.kind, "near", "text-only evidence must not be graded near");
@@ -606,7 +726,7 @@ fn spot_respects_suppression_and_top_k() {
     cfg.suppress = vec!["vendor/".into()];
     index::index_repo(repo.path(), &cfg).unwrap();
     let store = Store::open(&Store::default_path(repo.path())).unwrap();
-    let r = search::spot(repo.path(), &store, &cfg, "alpha", None, None, None).unwrap();
+    let r = search::spot(repo.path(), &store, &cfg, "alpha", None, None, None, None).unwrap();
     assert!(r.matches.iter().all(|m| !m.path.starts_with("vendor")));
 }
 
@@ -636,6 +756,7 @@ fn spot_top_k_truncates_textual_matches() {
         &store,
         &cfg(),
         "alpha bravo charlie delta echo",
+        None,
         None,
         None,
         None,
@@ -674,7 +795,17 @@ fn spot_on_empty_index_fails_open() {
     repo.commit_all("c1");
     // Never indexed: store exists but is empty.
     let store = Store::open(&Store::default_path(repo.path())).unwrap();
-    let r = search::spot(repo.path(), &store, &cfg(), "whatever", None, None, None).unwrap();
+    let r = search::spot(
+        repo.path(),
+        &store,
+        &cfg(),
+        "whatever",
+        None,
+        None,
+        None,
+        None,
+    )
+    .unwrap();
     assert!(r.matches.is_empty());
     assert!(r.stale, "empty index must report stale");
 }
@@ -1014,6 +1145,7 @@ fn store_rebuilds_on_schema_version_mismatch() {
                 &[ward_core::store::Symbol {
                     id: None,
                     file_path: "lib.rs".into(),
+                    module: String::new(),
                     language: "rust".into(),
                     name: "f".into(),
                     kind: "function_item".into(),
@@ -1091,6 +1223,7 @@ fn schema_rebuild_preserves_governance_data() {
                 &[ward_core::store::Symbol {
                     id: None,
                     file_path: "lib.rs".into(),
+                    module: String::new(),
                     language: "rust".into(),
                     name: "f".into(),
                     kind: "function_item".into(),

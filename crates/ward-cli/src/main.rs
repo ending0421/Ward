@@ -95,6 +95,10 @@ enum Cmd {
         /// auto-detected from the snippet when omitted.
         #[arg(long, value_name = "LANG")]
         language: Option<String>,
+        /// Monorepo scope filter (spec §2.6): only return hits from this
+        /// package/module; the hook flow derives it automatically.
+        #[arg(long)]
+        scope: Option<String>,
         #[arg(default_value = ".", long)]
         repo: PathBuf,
         #[arg(long)]
@@ -371,6 +375,7 @@ fn main() -> Result<()> {
             body,
             body_file,
             language,
+            scope,
             repo,
             json,
         } => {
@@ -408,6 +413,7 @@ fn main() -> Result<()> {
                 signature.as_deref(),
                 body_arg.as_deref(),
                 lang,
+                scope.as_deref(),
             )?;
             if json {
                 print_json(&result)?;
@@ -433,7 +439,17 @@ fn main() -> Result<()> {
         Cmd::SpotFile { path, repo, json } => {
             let cfg = load_config(&repo);
             let store = open_store(&repo)?;
-            let report = ward_core::spotfile::spot_new_symbols(&repo, &store, &cfg, &path)?;
+            // The hook flow is scope-aware: hits outside the written file's
+            // package/module are excluded (spec §2.6 monorepo hygiene).
+            let scope = ward_core::index::module_of_path(&repo, &path);
+            let scope = (!scope.is_empty()).then_some(scope);
+            let report = ward_core::spotfile::spot_new_symbols_scoped(
+                &repo,
+                &store,
+                &cfg,
+                &path,
+                scope.as_deref(),
+            )?;
             if json {
                 print_json(&report)?;
             } else {
