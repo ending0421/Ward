@@ -402,7 +402,7 @@ mod tests {
 
     #[test]
     fn outer_report_maps_outcomes() {
-        let cfg = WardConfig::default();
+        let _cfg = WardConfig::default();
         let pass = outer_report(true, "cargo test --quiet", "x".into(), 1);
         assert_eq!(pass.verdict, CatchVerdict::Pass);
         let fail = outer_report(false, "cargo test --quiet", "x".into(), 1);

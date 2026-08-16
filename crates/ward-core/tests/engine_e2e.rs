@@ -378,6 +378,64 @@ fn spot_resolves_kotlin_signatures_structurally() {
 }
 
 #[test]
+fn udl_definitions_index_and_replay_with_risk_marker() {
+    let repo = TestRepo::new();
+    repo.write(
+        "core/src/lib.rs",
+        "pub fn add(a: u32, b: u32) -> u32 { a + b }\n",
+    );
+    repo.write(
+        "core/src/api.udl",
+        "namespace calculator {\n    [Throws=CalcError]\n    interface Calculator {\n        [Throws=CalcError]\n        u32 add(u32 a, u32 b);\n        string describe();\n    };\n};\n",
+    );
+    let base = repo.commit_all("base");
+
+    // UDL symbols are indexed (language "udl", no tree-sitter grammar).
+    let report = index::index_repo(repo.path(), &cfg()).unwrap();
+    assert_eq!(report.files_indexed, 2, "{report:?}");
+    let store = Store::open(&Store::default_path(repo.path())).unwrap();
+    let udl_syms: Vec<_> = store
+        .all_symbols()
+        .unwrap()
+        .into_iter()
+        .filter(|s| s.language == "udl")
+        .collect();
+    assert!(
+        udl_syms
+            .iter()
+            .any(|s| s.name == "Calculator" && s.kind == "udl_interface"),
+        "interface must be indexed: {udl_syms:?}"
+    );
+
+    // A method-signature edit is SignatureChanged; the UDL risk marker fires.
+    repo.write(
+        "core/src/api.udl",
+        "namespace calculator {\n    [Throws=CalcError]\n    interface Calculator {\n        [Throws=CalcError]\n        u64 add(u32 a, u32 b);\n        string describe();\n    };\n};\n",
+    );
+    let head = repo.commit_all("head");
+    index::index_repo(repo.path(), &cfg()).unwrap();
+    let store = Store::open(&Store::default_path(repo.path())).unwrap();
+    let report = replay(repo.path(), &store, &cfg(), &base, &head).unwrap();
+    assert!(
+        report
+            .changes
+            .iter()
+            .any(|c| c.name == "Calculator" && c.change == ChangeKind::SignatureChanged),
+        "udl signature change must be classified: {:?}",
+        report.changes
+    );
+    assert!(
+        report
+            .risks
+            .iter()
+            .any(|r| r.description.contains("UDL")
+                && r.anchors.iter().any(|a| a.contains("api.udl"))),
+        "UDL change must carry the regeneration risk marker: {:?}",
+        report.risks
+    );
+}
+
+#[test]
 fn incremental_indexing_skips_unchanged_files() {
     let repo = TestRepo::new();
     repo.write("src/lib.rs", "pub fn f() {}\n");

@@ -112,6 +112,36 @@ fn signature_hash(node: &Node, spec: &LanguageSpec) -> Option<String> {
     Some(h.finalize().to_hex().to_string())
 }
 
+/// Extract the symbol surface of one file, dispatching UDL to the hand-
+/// rolled extractor (no tree-sitter grammar exists) and everything else to
+/// tree-sitter.
+fn surface_of(path: &str, source: &str) -> BTreeMap<(String, String), DiffSymbol> {
+    if path.ends_with(".udl") {
+        return crate::udl::extract(source)
+            .into_iter()
+            .map(|d| {
+                let hash = crate::udl::declaration_hash(&d);
+                (
+                    (d.name.clone(), d.kind.clone()),
+                    DiffSymbol {
+                        name: d.name.clone(),
+                        kind_of: d.kind.clone(),
+                        body_hash: hash.clone(),
+                        sig_hash: Some(hash),
+                        public: true,
+                        start_byte: d.start_byte as i64,
+                        end_byte: d.end_byte as i64,
+                    },
+                )
+            })
+            .collect();
+    }
+    let Some(lang) = Language::from_path(std::path::Path::new(path)) else {
+        return BTreeMap::new();
+    };
+    surface(source, lang.spec())
+}
+
 /// Extract the symbol surface of one source file.
 fn surface(source: &str, spec: &LanguageSpec) -> BTreeMap<(String, String), DiffSymbol> {
     let mut out = BTreeMap::new();
@@ -241,7 +271,7 @@ pub fn replay(
 ) -> Result<ReplayReport> {
     let changed_files = git::diff_names(repo, base, head)?
         .into_iter()
-        .filter(|p| Language::from_path(std::path::Path::new(p)).is_some())
+        .filter(|p| Language::from_path(std::path::Path::new(p)).is_some() || p.ends_with(".udl"))
         .collect::<Vec<_>>();
 
     let mut changes = Vec::new();
@@ -252,20 +282,21 @@ pub fn replay(
         }
         let old_src = git::show_file(repo, base, path)?;
         let new_src = git::show_file(repo, head, path)?;
-        // Files without a compiled grammar are skipped (fail-open).
-        let Some(lang) = Language::from_path(std::path::Path::new(path)) else {
-            continue;
-        };
-        if lang.ts_language().is_none() {
+        // Files without a compiled grammar are skipped (fail-open); UDL is
+        // covered by the hand-rolled extractor.
+        if !path.ends_with(".udl")
+            && Language::from_path(std::path::Path::new(path))
+                .map(|l| l.ts_language().is_none())
+                .unwrap_or(true)
+        {
             continue;
         }
-        let spec = lang.spec();
 
         let (old_lines, new_lines) = match (&old_src, &new_src) {
             (Some(o), Some(n)) => (o.clone(), n.clone()),
             (None, Some(n)) => {
                 // Brand-new file: every symbol is Added.
-                for (_, s) in surface(n, spec) {
+                for (_, s) in surface_of(path, n) {
                     changes.push(SymbolChange {
                         path: path.clone(),
                         lines: lines_of(n, s.start_byte, s.end_byte),
@@ -280,7 +311,7 @@ pub fn replay(
             }
             (Some(o), None) => {
                 // Deleted file: every symbol is Removed.
-                for (_, s) in surface(o, spec) {
+                for (_, s) in surface_of(path, o) {
                     changes.push(SymbolChange {
                         path: path.clone(),
                         lines: "-".into(),
@@ -296,13 +327,23 @@ pub fn replay(
             (None, None) => continue,
         };
 
-        let old = surface(&old_lines, spec);
-        let new = surface(&new_lines, spec);
+        let old = surface_of(path, &old_lines);
+        let new = surface_of(path, &new_lines);
+        let udl_file = path.ends_with(".udl");
+        let spec = if udl_file {
+            None
+        } else {
+            Language::from_path(std::path::Path::new(path)).map(|l| l.spec())
+        };
 
         // Doc-only edit at file level: the versions differ only in comments
         // (doc comments are siblings of declarations — symbol hashes are
-        // blind to them, spec §3-M2 doc_only detection).
-        if strip_comments(&old_lines, spec) == strip_comments(&new_lines, spec) {
+        // blind to them, spec §3-M2 doc_only detection). UDL declarations
+        // normalize comments away already, so the symbol loop handles it.
+        if !udl_file
+            && spec
+                .is_some_and(|sp| strip_comments(&old_lines, sp) == strip_comments(&new_lines, sp))
+        {
             for s in new.values() {
                 changes.push(SymbolChange {
                     path: path.clone(),
@@ -406,6 +447,21 @@ pub fn replay(
 
     // Risk markers (deterministic).
     let mut risks = Vec::new();
+    // UDL interface changes: the bindings are GENERATED artifacts — any
+    // .udl edit must be followed by regeneration + human review (0.5-2).
+    let udl_paths: Vec<String> = changed_files
+        .iter()
+        .filter(|p| p.ends_with(".udl"))
+        .cloned()
+        .collect();
+    if !udl_paths.is_empty() {
+        risks.push(RiskMarker {
+            severity: "high".into(),
+            description: "UDL 接口定义变更：绑定为生成物，必须重新生成（uniffi-bindgen）并人审"
+                .into(),
+            anchors: udl_paths.iter().map(|p| format!("{p}:1")).collect(),
+        });
+    }
     for c in &changes {
         match c.change {
             ChangeKind::SignatureChanged if c.public => risks.push(RiskMarker {

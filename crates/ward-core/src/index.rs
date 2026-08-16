@@ -357,6 +357,40 @@ impl Indexer<'_> {
                 report.files_suppressed += 1;
                 continue;
             }
+            // UDL interface files (spec §3.0 contract, 0.5-2): no tree-sitter
+            // grammar exists, so the thin hand-rolled extractor supplies the
+            // symbols. The interface surface is ALWAYS indexed (it is the
+            // cross-language contract, not a language choice).
+            if rel.ends_with(".udl") {
+                let Ok(source) = std::fs::read_to_string(&path) else {
+                    continue;
+                };
+                let module = module_of(self.repo_root, &rel, &mut module_cache);
+                let defs = crate::udl::extract(&source);
+                let symbols: Vec<Symbol> = defs
+                    .iter()
+                    .map(|d| Symbol {
+                        id: None,
+                        file_path: rel.clone(),
+                        module: module.clone(),
+                        language: "udl".to_string(),
+                        name: d.name.clone(),
+                        kind: d.kind.clone(),
+                        start_byte: d.start_byte as i64,
+                        end_byte: d.end_byte as i64,
+                        body_hash: crate::udl::declaration_hash(d),
+                        struct_hash: crate::udl::declaration_hash(d),
+                        simhash: crate::udl::declaration_simhash(d),
+                        sig_simhash: crate::udl::declaration_simhash(d),
+                        in_test: false,
+                        commit_sha: sha.clone(),
+                    })
+                    .collect();
+                self.store.replace_file(&rel, &symbols)?;
+                report.files_indexed += 1;
+                report.symbols_indexed += symbols.len();
+                continue;
+            }
             let Some(lang) = Language::from_path(&path) else {
                 continue;
             };
