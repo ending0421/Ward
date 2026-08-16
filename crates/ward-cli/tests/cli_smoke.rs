@@ -372,7 +372,10 @@ fn doctor_report_and_issue_dry_run() {
     let data = &d["data"];
     assert!(data["store"]["symbols"].as_i64().unwrap() >= 1);
     assert!(data["redacted"] == true);
-    assert!(data["repo_path"].is_null(), "path must be redacted by default");
+    assert!(
+        data["repo_path"].is_null(),
+        "path must be redacted by default"
+    );
     // bundle is written when requested.
     let out = ward(&["doctor", "--repo", ".", "--bundle"], repo.path());
     assert!(out.status.success());
