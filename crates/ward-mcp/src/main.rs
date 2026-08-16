@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::{ServiceExt, schemars, tool, tool_router, transport::stdio};
 use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use ward_core::config::{self, WardConfig};
 use ward_core::store::Store;
 use ward_core::verify::{catch_run, verify_full};
@@ -111,36 +111,19 @@ pub struct SpotActionParams {
     pub repo: Option<String>,
 }
 
-/// Serialized wrapper that makes tool failures explicit instead of fatal.
-#[derive(Serialize)]
-struct ToolEnvelope<T: Serialize> {
-    ok: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    error: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    data: Option<T>,
-}
+/// Serialized wrapper shared with the CLI (issue #4): both surfaces emit
+/// the same `{ok, data}` envelope.
+type ToolEnvelope<T> = ward_core::envelope::Envelope<T>;
 
-impl<T: Serialize> ToolEnvelope<T> {
-    fn ok(data: T) -> String {
-        serde_json::to_string_pretty(&ToolEnvelope {
-            ok: true,
-            error: None,
-            data: Some(data),
-        })
+fn tool_ok<T: serde::Serialize>(data: T) -> String {
+    let envelope = ToolEnvelope::ok(data);
+    serde_json::to_string_pretty(&envelope)
         .unwrap_or_else(|_| r#"{"ok":false,"error":"serialize failed"}"#.into())
-    }
 }
 
-/// Non-generic error envelope (fail-open tools report errors as structured
-/// output instead of dying).
 fn tool_err(e: impl std::fmt::Display) -> String {
-    serde_json::to_string(&ToolEnvelope {
-        ok: false,
-        error: Some(e.to_string()),
-        data: None::<serde_json::Value>,
-    })
-    .unwrap_or_else(|_| r#"{"ok":false,"error":"serialize failed"}"#.into())
+    serde_json::to_string(&ToolEnvelope::<serde_json::Value>::err(e))
+        .unwrap_or_else(|_| r#"{"ok":false,"error":"serialize failed"}"#.into())
 }
 
 #[derive(Clone)]
@@ -177,7 +160,7 @@ impl WardMcp {
             )
         })();
         match result {
-            Ok(r) => ToolEnvelope::ok(r),
+            Ok(r) => tool_ok(r),
             Err(e) => tool_err(format!("spot failed (fail-open): {e}")),
         }
     }
@@ -205,7 +188,7 @@ impl WardMcp {
             }
         })();
         match result {
-            Ok(r) => ToolEnvelope::ok(r),
+            Ok(r) => tool_ok(r),
             Err(e) => tool_err(format!("replay failed (fail-open): {e}")),
         }
     }
@@ -223,7 +206,7 @@ impl WardMcp {
         } else {
             catch_run(&repo, &cfg)
         };
-        ToolEnvelope::ok(report)
+        tool_ok(report)
     }
 
     /// Outer-loop sandbox adjudication — only meaningful on machines with
@@ -234,7 +217,7 @@ impl WardMcp {
     fn verify_full(&self, Parameters(p): Parameters<CatchRunParams>) -> String {
         let repo = resolve_repo(p.repo);
         let cfg = load_config(&repo);
-        ToolEnvelope::ok(verify_full(&repo, &cfg))
+        tool_ok(verify_full(&repo, &cfg))
     }
 
     /// Evaluate a task spec's assertions against base..head (inner-loop
@@ -269,7 +252,7 @@ impl WardMcp {
             }))
         })();
         match result {
-            Ok(r) => ToolEnvelope::ok(r),
+            Ok(r) => tool_ok(r),
             Err(e) => tool_err(format!("form_check failed (fail-open): {e}")),
         }
     }
@@ -281,7 +264,7 @@ impl WardMcp {
     )]
     fn compat_check(&self, Parameters(p): Parameters<CompatCheckParams>) -> String {
         let repo = resolve_repo(p.repo);
-        ToolEnvelope::ok(ward_core::compat::api_compat_check(
+        tool_ok(ward_core::compat::api_compat_check(
             &repo,
             &p.base.unwrap_or_else(|| "HEAD^".into()),
         ))
@@ -314,7 +297,7 @@ impl WardMcp {
             )
         })();
         match result {
-            Ok(r) => ToolEnvelope::ok(r),
+            Ok(r) => tool_ok(r),
             Err(e) => tool_err(format!("intent_check failed (fail-open): {e}")),
         }
     }
@@ -332,7 +315,7 @@ impl WardMcp {
             ward_core::context::context_card(&repo, &store, &cfg, &p.query)
         })();
         match result {
-            Ok(r) => ToolEnvelope::ok(r),
+            Ok(r) => tool_ok(r),
             Err(e) => tool_err(format!("context_card failed (fail-open): {e}")),
         }
     }
@@ -348,7 +331,7 @@ impl WardMcp {
             ward_core::cluster::cluster_duplicates(&store, p.threshold.unwrap_or(0.92))
         })();
         match result {
-            Ok(r) => ToolEnvelope::ok(r),
+            Ok(r) => tool_ok(r),
             Err(e) => tool_err(format!("clusters failed (fail-open): {e}")),
         }
     }
@@ -366,7 +349,7 @@ impl WardMcp {
             Ok(())
         })();
         match result {
-            Ok(()) => ToolEnvelope::ok(serde_json::json!({"recorded": true})),
+            Ok(()) => tool_ok(serde_json::json!({"recorded": true})),
             Err(e) => tool_err(format!("spot_action failed: {e}")),
         }
     }

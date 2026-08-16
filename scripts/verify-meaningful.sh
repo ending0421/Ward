@@ -66,7 +66,7 @@ echo "== 第 2 层：已知案例召回/精度（引擎行为正确） =="
 HITS=$(python3 - <<'PY'
 import json
 r = json.load(open("/tmp/s1.json"))
-m = [x for x in r["matches"] if x["path"] == "src/clone.rs"]
+m = [x for x in r["data"]["matches"] if x["path"] == "src/clone.rs"]
 print("yes" if m and m[0]["kind"] == "structural" and m[0]["similarity"] == 1.0 else "no")
 PY
 )
@@ -78,7 +78,7 @@ check "精确克隆被 L1 命中（kind=structural, sim=1.0）" "$HITS" "yes"
 HITS=$(python3 - <<'PY'
 import json
 r = json.load(open("/tmp/s2.json"))
-m = [x for x in r["matches"] if x["path"] == "src/near.rs"]
+m = [x for x in r["data"]["matches"] if x["path"] == "src/near.rs"]
 print("yes" if m and m[0]["similarity"] >= 0.8 else "no")
 PY
 )
@@ -90,7 +90,7 @@ check "copy-then-modify 被 L2 命中（sim ≥ 0.8）" "$HITS" "yes"
 HITS=$(python3 -c "
 import json
 r = json.load(open('/tmp/s3.json'))
-print('no' if all('debounce' not in x['symbol'] for x in r['matches']) else 'yes')
+print('no' if all('debounce' not in x['symbol'] for x in r['data']['matches']) else 'yes')
 ")
 check "无关函数不产生 debounce 误报" "$HITS" "no"
 
@@ -104,11 +104,11 @@ rm src/broken.rs
 # 3b: per-file 新鲜度 — 未提交修改 → stale
 echo '// tweak' >> src/original.rs
 "$WARD" spot --repo . --intent "防抖" --signature "pub fn debounce(f: &dyn Fn(u64), ms: u64) -> u8 { f(ms); 0 }" --json > /tmp/s4.json
-check "未提交修改 → advisory stale=true（绝不假装新鲜）" "$(python3 -c "import json; print(json.load(open('/tmp/s4.json'))['stale'])")" "True"
+check "未提交修改 → advisory stale=true（绝不假装新鲜）" "$(python3 -c "import json; print(json.load(open('/tmp/s4.json'))['data']['stale'])")" "True"
 git checkout -q src/original.rs
 # 3c: 外环裁决一致性不变量 —— 沙箱可用 ⇔ 真裁决(pass/fail)；沙箱不可用 ⇔ unknown
 "$WARD" verify --full --repo . --json > /tmp/v.json 2>&1 || true
-V=$(python3 -c "import json; print(json.load(open('/tmp/v.json'))['verdict'])" 2>/dev/null || echo missing)
+V=$(python3 -c "import json; print(json.load(open('/tmp/v.json'))['data']['verdict'])" 2>/dev/null || echo missing)
 if docker info >/dev/null 2>&1; then
   check "有 Docker：verify --full 给出真实裁决（pass/fail，非 unknown、非 fake green）" "$([ "$V" = "pass" ] || [ "$V" = "fail" ] && echo ok || echo bad)" "ok"
 else
@@ -124,7 +124,7 @@ check "must_pass → deferred（不伪造测试通过）" "$(grep -c '\[deferred
 check "api_compat → unknown（无工具无裁决）" "$(grep -c '\[unknown\] api_compat' /tmp/fc.log)" "1"
 # 3e: 无 LLM → 诚实"未执行"
 "$WARD" intent-check --repo . --requirement "实现防抖" --json > /tmp/ic.json 2>&1
-check "无 LLM provider → intent-check executed=false（不伪造判断）" "$(python3 -c "import json; print(json.load(open('/tmp/ic.json'))['executed'])")" "False"
+check "无 LLM provider → intent-check executed=false（不伪造判断）" "$(python3 -c "import json; print(json.load(open('/tmp/ic.json'))['data']['executed'])")" "False"
 
 echo ""
 echo "======================================"

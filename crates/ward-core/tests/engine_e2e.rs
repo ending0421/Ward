@@ -501,6 +501,54 @@ fn replay_skips_non_code_files() {
 }
 
 #[test]
+fn near_set_is_a_pure_function_of_signature_not_intent() {
+    // Issue #3: rewording ONLY the intent must not change the near set —
+    // automated consumers (hooks/CI) cannot author a "good" intent.
+    let repo = TestRepo::new();
+    repo.write(
+        "src/lib.rs",
+        "pub fn push_fill_quad(rect: &Rect, color: u32) { tessellate(rect); paint(color) }\npub fn push_rotated_corners(rect: &Rect, color: u32) { tessellate(rect); rotate(color) }\npub struct Rect { pub x: f32, pub y: f32 }\nfn tessellate(_r: &Rect) {}\nfn paint(_c: u32) {}\nfn rotate(_c: u32) {}\n",
+    );
+    repo.commit_all("c1");
+    index::index_repo(repo.path(), &cfg()).unwrap();
+    let store = Store::open(&Store::default_path(repo.path())).unwrap();
+    let sig = "pub fn push_rounded_rect(rect: &Rect, color: u32)";
+    let body = "tessellate(rect); paint(color)";
+    let intent_a = "new Rust function push_rounded_rect with signature: pub fn push_rounded_rect(rect: &Rect, color: u32) — being added to the engine renderer";
+    let intent_b = "pre-edit duplicate check for Rust code being written in the engine";
+    let r_a = search::spot(
+        repo.path(),
+        &store,
+        &cfg(),
+        intent_a,
+        Some(sig),
+        Some(body),
+        Some(Language::Rust),
+    )
+    .unwrap();
+    let r_b = search::spot(
+        repo.path(),
+        &store,
+        &cfg(),
+        intent_b,
+        Some(sig),
+        Some(body),
+        Some(Language::Rust),
+    )
+    .unwrap();
+    let near_of = |r: &ward_core::search::SpotResult| -> Vec<(String, f64)> {
+        r.matches
+            .iter()
+            .filter(|m| m.kind == "near")
+            .map(|m| (m.symbol.clone(), m.similarity))
+            .collect()
+    };
+    let a = near_of(&r_a);
+    assert!(!a.is_empty(), "near hits must exist: {:?}", r_a.matches);
+    assert_eq!(a, near_of(&r_b), "near set must be intent-invariant");
+}
+
+#[test]
 fn freshness_never_indexed_never_committed_is_stale() {
     let repo = TestRepo::new();
     let store = Store::open(&Store::default_path(repo.path())).unwrap();

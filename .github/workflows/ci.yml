@@ -33,8 +33,8 @@ jobs:
           python3 - <<'EOF'
           import json
           r = json.load(open("/tmp/spot.json"))
-          assert r["matches"], "dogfood spot must match its own simhash"
-          print("dogfood spot OK:", [(m["path"], m["lines"], m["similarity"]) for m in r["matches"]])
+          assert r["data"]["matches"], "dogfood spot must match its own simhash"
+          print("dogfood spot OK:", [(m["path"], m["lines"], m["similarity"]) for m in r["data"]["matches"]])
           EOF
       - name: Hook smoke (PostToolUse auto spot-file + additionalContext)
         run: |

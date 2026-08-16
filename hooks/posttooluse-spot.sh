@@ -75,7 +75,7 @@ for p in list(dict.fromkeys(paths))[:5]:
         report = json.loads(out.stdout)
     except Exception:
         continue
-    for adv in report.get("advisories") or []:
+    for adv in (report.get("data") or {}).get("advisories") or []:
         for m in adv.get("matches") or []:
             if m.get("similarity", 0) >= 0.92:
                 hits.append(

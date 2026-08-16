@@ -71,9 +71,12 @@ fn init_index_spot_roundtrip() {
     assert!(out.status.success());
     let json: serde_json::Value =
         serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).expect("json");
-    assert!(json["matches"].is_array());
-    assert_eq!(json["stale"], false);
-    let id = json["advisory_id"].as_str().unwrap().to_string();
+    // Issue #4: CLI --json carries the {ok, data} envelope.
+    assert_eq!(json["ok"], true, "envelope expected: {json}");
+    let data = &json["data"];
+    assert!(data["matches"].is_array());
+    assert_eq!(data["stale"], false);
+    let id = data["advisory_id"].as_str().unwrap().to_string();
 
     // feedback loop: self-reported action roundtrip
     let out = ward(&["action", "--repo", ".", &id, "accepted"], repo.path());
@@ -134,8 +137,10 @@ fn card_clusters_replay_and_intent_roundtrip() {
     assert!(out.status.success());
     let json: serde_json::Value =
         serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).unwrap();
-    assert!(json["clusters"].is_array());
-    assert_eq!(json["truncated"], false);
+    assert_eq!(json["ok"], true, "envelope expected: {json}");
+    let data = &json["data"];
+    assert!(data["clusters"].is_array());
+    assert_eq!(data["truncated"], false);
 
     // Replay needs two commits.
     std::fs::write(
@@ -182,8 +187,9 @@ fn card_clusters_replay_and_intent_roundtrip() {
     assert!(out.status.success());
     let json: serde_json::Value =
         serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).unwrap();
-    assert_eq!(json["executed"], false);
-    assert_eq!(json["partition"], "llm_soft");
+    let data = &json["data"];
+    assert_eq!(data["executed"], false);
+    assert_eq!(data["partition"], "llm_soft");
 }
 
 #[test]
@@ -263,7 +269,7 @@ fn setup_hooks_and_infer_roundtrip() {
     assert!(out.status.success());
     let json: serde_json::Value =
         serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).unwrap();
-    assert_eq!(json["considered"], 0);
+    assert_eq!(json["data"]["considered"], 0);
     // removal is idempotent and honest.
     let out = ward(&["setup-hooks", "--repo", ".", "--remove"], repo.path());
     assert!(out.status.success());
@@ -292,9 +298,9 @@ fn stats_and_calibrate_report_from_seeded_data() {
     assert!(out.status.success());
     let json: serde_json::Value =
         serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).unwrap();
-    let id = json["advisory_id"].as_str().unwrap().to_string();
+    let id = json["data"]["advisory_id"].as_str().unwrap().to_string();
     // Label the first match (if any) or skip the label assertions gracefully.
-    if !json["matches"].as_array().unwrap().is_empty() {
+    if !json["data"]["matches"].as_array().unwrap().is_empty() {
         let out = ward(&["label", "set", &id, "0", "y", "--repo", "."], repo.path());
         assert!(
             out.status.success(),
@@ -317,9 +323,10 @@ fn stats_and_calibrate_report_from_seeded_data() {
     );
     let rep: serde_json::Value =
         serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).unwrap();
-    assert_eq!(rep["schema_version"], 1);
-    assert!(rep["series"].as_array().unwrap().len() >= 4);
-    assert_eq!(rep["stability"], "unstable");
+    let data = &rep["data"];
+    assert_eq!(data["schema_version"], 1);
+    assert!(data["series"].as_array().unwrap().len() >= 4);
+    assert_eq!(data["stability"], "unstable");
 }
 
 #[test]
@@ -362,9 +369,10 @@ fn doctor_report_and_issue_dry_run() {
         String::from_utf8_lossy(&out.stderr)
     );
     let d: serde_json::Value = serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).unwrap();
-    assert!(d["store"]["symbols"].as_i64().unwrap() >= 1);
-    assert!(d["redacted"] == true);
-    assert!(d["repo_path"].is_null(), "path must be redacted by default");
+    let data = &d["data"];
+    assert!(data["store"]["symbols"].as_i64().unwrap() >= 1);
+    assert!(data["redacted"] == true);
+    assert!(data["repo_path"].is_null(), "path must be redacted by default");
     // bundle is written when requested.
     let out = ward(&["doctor", "--repo", ".", "--bundle"], repo.path());
     assert!(out.status.success());
@@ -394,11 +402,12 @@ fn doctor_report_and_issue_dry_run() {
     );
     let json: serde_json::Value =
         serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).unwrap();
-    let id = json["advisory_id"].as_str().unwrap().to_string();
+    let id = json["data"]["advisory_id"].as_str().unwrap().to_string();
     let out = ward(&["report", &id, "--repo", ".", "--json"], repo.path());
     assert!(out.status.success());
     let rep: serde_json::Value =
         serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).unwrap();
+    let rep = &rep["data"];
     assert_eq!(rep["id"], id);
     assert!(rep["snippets"].is_null(), "snippets opt-in only");
 }

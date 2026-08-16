@@ -87,6 +87,10 @@ enum Cmd {
         signature: Option<String>,
         #[arg(long)]
         body: Option<String>,
+        /// Read the written body from a file (hook/CI contexts; argv has
+        /// ARG_MAX limits). Mutually exclusive with --body.
+        #[arg(long)]
+        body_file: Option<PathBuf>,
         /// Signature language override ("rust|kotlin|swift|java|objc");
         /// auto-detected from the snippet when omitted.
         #[arg(long, value_name = "LANG")]
@@ -306,6 +310,17 @@ enum Cmd {
     },
 }
 
+/// CLI `--json` output shares the MCP `{ok, data}` envelope (issue #4):
+/// a consumer written against one surface must never silently read an
+/// empty set from the other.
+fn print_json<T: serde::Serialize>(value: &T) -> anyhow::Result<()> {
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&ward_core::envelope::Envelope::ok(value))?
+    );
+    Ok(())
+}
+
 fn load_config(repo: &std::path::Path) -> WardConfig {
     let path = config::default_path(repo);
     let (cfg, warn) = WardConfig::load_or_default(&path);
@@ -354,6 +369,7 @@ fn main() -> Result<()> {
             intent,
             signature,
             body,
+            body_file,
             language,
             repo,
             json,
@@ -373,17 +389,28 @@ fn main() -> Result<()> {
                 }
                 None => None,
             };
+            let body_arg = match (body.as_deref(), body_file.as_deref()) {
+                (Some(_), Some(_)) => {
+                    anyhow::bail!("--body and --body-file are mutually exclusive")
+                }
+                (None, Some(path)) => Some(
+                    std::fs::read_to_string(path)
+                        .with_context(|| format!("reading --body-file {}", path.display()))?,
+                ),
+                (Some(b), None) => Some(b.to_string()),
+                (None, None) => None,
+            };
             let result = search::spot(
                 &repo,
                 &store,
                 &cfg,
                 &intent,
                 signature.as_deref(),
-                body.as_deref(),
+                body_arg.as_deref(),
                 lang,
             )?;
             if json {
-                println!("{}", serde_json::to_string_pretty(&result)?);
+                print_json(&result)?;
             } else {
                 println!(
                     "spot advisory {} (as_of={:?}, stale={})",
@@ -408,7 +435,7 @@ fn main() -> Result<()> {
             let store = open_store(&repo)?;
             let report = ward_core::spotfile::spot_new_symbols(&repo, &store, &cfg, &path)?;
             if json {
-                println!("{}", serde_json::to_string_pretty(&report)?);
+                print_json(&report)?;
             } else {
                 println!(
                     "spot-file {}: {} new/changed, {} checked",
@@ -446,7 +473,7 @@ fn main() -> Result<()> {
             let store = open_store(&repo)?;
             let report = diff::replay(&repo, &store, &cfg, &base, &head)?;
             if json {
-                println!("{}", serde_json::to_string_pretty(&report)?);
+                print_json(&report)?;
             } else if narrate {
                 let provider = ward_core::llm::http_llm_from_env();
                 let out = ward_core::narrate::narrate(&report, provider.as_deref());
@@ -459,7 +486,7 @@ fn main() -> Result<()> {
             let cfg = load_config(&repo);
             let report = catch_run(&repo, &cfg);
             if json {
-                println!("{}", serde_json::to_string_pretty(&report)?);
+                print_json(&report)?;
             } else {
                 println!(
                     "catch_run: {} — {} ({:?})",
@@ -487,7 +514,7 @@ fn main() -> Result<()> {
                 catch_run(&repo, &cfg)
             };
             if json {
-                println!("{}", serde_json::to_string_pretty(&report)?);
+                print_json(&report)?;
             } else {
                 println!(
                     "verify: {} — {} ({:?})",
@@ -541,7 +568,7 @@ fn main() -> Result<()> {
                 })?;
             }
             if json {
-                println!("{}", serde_json::to_string_pretty(&results)?);
+                print_json(&results)?;
             } else {
                 println!(
                     "form-check {} ({}..{}):",
@@ -573,7 +600,7 @@ fn main() -> Result<()> {
         Cmd::CompatCheck { base, repo, json } => {
             let report = ward_core::compat::api_compat_check(&repo, &base);
             if json {
-                println!("{}", serde_json::to_string_pretty(&report)?);
+                print_json(&report)?;
             } else {
                 println!(
                     "compat-check [{}] {} — {} ({:?})",
@@ -596,7 +623,7 @@ fn main() -> Result<()> {
             let cfg = load_config(&repo);
             let report = ward_core::infer::infer_pending(&repo, &store, &cfg)?;
             if json {
-                println!("{}", serde_json::to_string_pretty(&report)?);
+                print_json(&report)?;
             } else {
                 println!(
                     "inferred {} advisories: {} accepted / {} reused-ish / {} rejected / {} unknown",
@@ -618,7 +645,7 @@ fn main() -> Result<()> {
                 let store = open_store(&repo)?;
                 let cands = ward_core::label::candidates_by(&store, &repo, count, &annotator)?;
                 if json {
-                    println!("{}", serde_json::to_string_pretty(&cands)?);
+                    print_json(&cands)?;
                 } else if cands.is_empty() {
                     println!("没有未标注的 match（标注者 {annotator}）。跑几次 spot 后再来。");
                 } else {
@@ -665,7 +692,7 @@ fn main() -> Result<()> {
             let store = open_store(&repo)?;
             let report = ward_core::calibrate::calibrate(&store)?;
             if json {
-                println!("{}", serde_json::to_string_pretty(&report)?);
+                print_json(&report)?;
             } else {
                 println!("标注总数: {} | {}", report.total_verdicts, report.note);
                 for r in &report.rows {
@@ -698,7 +725,7 @@ fn main() -> Result<()> {
             let cfg = load_config(&repo);
             let snap = ward_core::stats::snapshot_now(&repo, &store, &cfg)?;
             if json {
-                println!("{}", serde_json::to_string_pretty(&snap)?);
+                print_json(&snap)?;
             } else {
                 println!(
                     "snapshot day={} symbols={} clusters={} advisories={} labels={}",
@@ -711,7 +738,7 @@ fn main() -> Result<()> {
             let cfg = load_config(&repo);
             let report = ward_core::stats::stats(&repo, &store, &cfg)?;
             if json {
-                println!("{}", serde_json::to_string_pretty(&report)?);
+                print_json(&report)?;
             } else {
                 print!("{}", ward_core::stats::render_table(&report));
             }
@@ -731,7 +758,7 @@ fn main() -> Result<()> {
             };
             let report = ward_core::doctor::doctor(&repo, &opts)?;
             if json {
-                println!("{}", serde_json::to_string_pretty(&report)?);
+                print_json(&report)?;
             } else {
                 println!(
                     "ward {} / {} / 仓库 {}（{} 符号）",
@@ -777,7 +804,7 @@ fn main() -> Result<()> {
                         detail = ward_core::report::with_snippets(detail, &repo);
                     }
                     if json {
-                        println!("{}", serde_json::to_string_pretty(&detail)?);
+                        print_json(&detail)?;
                     } else {
                         println!("advisory {} (ts {})", detail.id, detail.ts);
                         println!("  查询: {}", detail.query.as_deref().unwrap_or("-"));
@@ -1064,7 +1091,7 @@ fn main() -> Result<()> {
                 },
             };
             if json {
-                println!("{}", serde_json::to_string_pretty(&hint)?);
+                print_json(&hint)?;
             } else {
                 println!(
                     "intent-check [{}] executed={}:",
@@ -1081,7 +1108,7 @@ fn main() -> Result<()> {
             let store = open_store(&repo)?;
             let card = ward_core::context::context_card(&repo, &store, &cfg, &query)?;
             if json {
-                println!("{}", serde_json::to_string_pretty(&card)?);
+                print_json(&card)?;
             } else {
                 println!(
                     "{} ({}) {}:{}",
@@ -1112,7 +1139,7 @@ fn main() -> Result<()> {
             let store = open_store(&repo)?;
             let report = ward_core::cluster::cluster_duplicates(&store, threshold)?;
             if json {
-                println!("{}", serde_json::to_string_pretty(&report)?);
+                print_json(&report)?;
             } else {
                 println!(
                     "{} clusters ({} pairwise checks, truncated={})",

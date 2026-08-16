@@ -13,6 +13,7 @@ pub mod daemon;
 pub mod diff;
 pub mod doctor;
 pub mod embedding;
+pub mod envelope;
 pub mod fingerprint;
 pub mod fresh;
 pub mod git;

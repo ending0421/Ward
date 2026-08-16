@@ -316,30 +316,69 @@ pub fn spot(
         }
     }
 
-    // Layers 2+3: BM25 recall, then simhash ranking over candidates.
-    let candidates = bm25.recall(&query, 50);
+    // Layers 2+3: the near set is a pure function of the signature and the
+    // index (issue #3): when the signature parses, EVERY symbol's
+    // sig_simhash is compared (O(N) XOR+popcount, ~ms at 10⁵ — F11 budget)
+    // instead of a BM25 top-50 whose composition depended on intent
+    // phrasing. Intent only feeds the textual channel (no fingerprint) and
+    // never gates which structural hits are returned.
     let mut ranked: Vec<(SpotMatch, f64)> = Vec::new();
     let mut claimed: HashSet<(String, String)> = matches
         .iter()
         .map(|m| (m.path.clone(), m.symbol.clone()))
         .collect();
-    for (idx, bm25_score) in candidates {
-        let sym = &symbols[idx];
-        if config.is_suppressed(&sym.file_path) {
-            continue;
+    match query_sim {
+        Some(q) => {
+            let mut near: Vec<(usize, f64)> = symbols
+                .iter()
+                .enumerate()
+                .map(|(i, s)| (i, fingerprint::simhash_similarity(q, s.sig_simhash)))
+                .filter(|(_, sim)| *sim >= config.thresholds.weak)
+                .collect();
+            near.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            // Only materialize what can still fit under top_k: each push
+            // reads the hit file for its line range (F11).
+            let budget = config.top_k.saturating_sub(matches.len());
+            let mut taken = 0;
+            for (idx, sim) in near {
+                if taken >= budget {
+                    break;
+                }
+                let sym = &symbols[idx];
+                if config.is_suppressed(&sym.file_path) {
+                    continue;
+                }
+                if !claimed.insert((sym.file_path.clone(), sym.name.clone())) {
+                    continue;
+                }
+                ranked.push((
+                    SpotMatch {
+                        path: sym.file_path.clone(),
+                        lines: line_range(&repo.join(&sym.file_path), sym.start_byte, sym.end_byte),
+                        symbol: sym.name.clone(),
+                        similarity: sim,
+                        kind: "near".into(),
+                        note: String::new(),
+                    },
+                    sim,
+                ));
+                taken += 1;
+            }
         }
-        if !claimed.insert((sym.file_path.clone(), sym.name.clone())) {
-            continue;
-        }
-        let (kind, sim) = match query_sim {
-            // Signature-shaped queries compare against the signature
-            // simhash (full-body simhash is for block/body-level checks).
-            Some(q) => ("near", fingerprint::simhash_similarity(q, sym.sig_simhash)),
-            // No fingerprint evidence: BM25 + L3 token-bag supplement,
-            // normalized to [0,1]. Calibration: a single rare-token hit
-            // (df=1 ⇒ idf ≈ ln N/1.5) must clear the weak band. Textual
-            // evidence is capped at Weak by the grade rule regardless.
-            None => {
+        // No fingerprint evidence: BM25 + L3 token-bag supplement,
+        // normalized to [0,1]. Calibration: a single rare-token hit
+        // (df=1 ⇒ idf ≈ ln N/1.5) must clear the weak band. Textual
+        // evidence is capped at Weak by the grade rule regardless.
+        None => {
+            let candidates = bm25.recall(&query, 50);
+            for (idx, bm25_score) in candidates {
+                let sym = &symbols[idx];
+                if config.is_suppressed(&sym.file_path) {
+                    continue;
+                }
+                if !claimed.insert((sym.file_path.clone(), sym.name.clone())) {
+                    continue;
+                }
                 let bm25_norm = (bm25_score / 1.5).min(1.0);
                 let embedder = crate::embedding::HashingEmbedder::new(128);
                 let supplement = match (
@@ -349,21 +388,25 @@ pub fn spot(
                     (Some(q), Some(d)) => crate::embedding::cosine(&q, &d).max(0.0),
                     _ => 0.0,
                 };
-                ("textual", bm25_norm.max(supplement as f64))
+                let sim = bm25_norm.max(supplement as f64);
+                if seen.insert(idx) {
+                    ranked.push((
+                        SpotMatch {
+                            path: sym.file_path.clone(),
+                            lines: line_range(
+                                &repo.join(&sym.file_path),
+                                sym.start_byte,
+                                sym.end_byte,
+                            ),
+                            symbol: sym.name.clone(),
+                            similarity: sim,
+                            kind: "textual".into(),
+                            note: String::new(),
+                        },
+                        sim,
+                    ));
+                }
             }
-        };
-        if seen.insert(idx) {
-            ranked.push((
-                SpotMatch {
-                    path: sym.file_path.clone(),
-                    lines: line_range(&repo.join(&sym.file_path), sym.start_byte, sym.end_byte),
-                    symbol: sym.name.clone(),
-                    similarity: sim,
-                    kind: kind.into(),
-                    note: String::new(),
-                },
-                sim,
-            ));
         }
     }
     ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
