@@ -35,6 +35,11 @@ check() { # check <name> <expected_behavior>
 
 echo "== 准备：埋入四类已知案例 =="
 mkdir -p src
+cat > Cargo.toml <<'TOML'
+[package]
+name = "ward-harness-fixture"
+version = "0.1.0"
+TOML
 # 案例 1: 原实现
 cat > src/original.rs <<'RS'
 pub fn debounce(f: &dyn Fn(u64), ms: u64) -> u8 { f(ms); 0 }
