@@ -666,6 +666,78 @@ fn replay_skips_non_code_files() {
 }
 
 #[test]
+fn low_specificity_signatures_are_flagged_and_never_strong() {
+    // Issue #5: all-basic-type signatures degenerate to shape-only matches
+    // (34/34 FP in the issue golden set). They must still be RETURNED for
+    // humans, but flagged low_confidence and never graded Strong — the
+    // automated-gate semantics.
+    let repo = TestRepo::new();
+    repo.write(
+        "src/lib.rs",
+        "pub fn debounce(f: &dyn Fn(u64), ms: u64) -> u8 { f(ms); 0 }\npub fn unlock_all(n: usize, step: u32) -> u64 { 0 }\npub fn push_segment(from: u32, to: u32) -> u8 { 0 }\n",
+    );
+    repo.commit_all("c1");
+    index::index_repo(repo.path(), &cfg()).unwrap();
+    let store = Store::open(&Store::default_path(repo.path())).unwrap();
+    let r = search::spot(
+        repo.path(),
+        &store,
+        &cfg(),
+        "pre-edit duplicate check",
+        Some("pub fn debounce(f: &dyn Fn(u64), ms: u64) -> u8"),
+        None,
+        Some(Language::Rust),
+        None,
+    )
+    .unwrap();
+    assert_eq!(r.query_specificity, 0.0);
+    assert!(r.low_confidence, "all-basic query must be low confidence");
+    assert!(
+        !r.matches.is_empty(),
+        "matches are still returned for humans: {:?}",
+        r.matches
+    );
+    assert!(
+        r.matches.iter().all(|m| !m.note.is_empty()),
+        "capped matches carry the gate-ignore note: {:?}",
+        r.matches
+    );
+
+    // Domain-typed queries keep full grading.
+    repo.write(
+        "src/geo.rs",
+        "pub struct ModelRect { pub x: f32, pub y: f32 }\npub fn push_fill(rect: &ModelRect, color: u32) -> u8 { 0 }\n",
+    );
+    repo.commit_all("c2");
+    index::index_repo(repo.path(), &cfg()).unwrap();
+    let store = Store::open(&Store::default_path(repo.path())).unwrap();
+    let r = search::spot(
+        repo.path(),
+        &store,
+        &cfg(),
+        "geometry",
+        Some("pub fn push_fill(rect: &ModelRect, color: u32) -> u8"),
+        None,
+        Some(Language::Rust),
+        None,
+    )
+    .unwrap();
+    assert!(r.query_specificity >= 0.5, "domain-typed query: {r:?}");
+    assert!(!r.low_confidence);
+    let hit = r
+        .matches
+        .iter()
+        .find(|m| m.symbol == "push_fill")
+        .expect("hit kept");
+    assert!(hit.similarity >= 0.8, "fingerprint evidence: {hit:?}");
+    assert!(
+        hit.note.is_empty(),
+        "no clamp when the query is specific enough: {hit:?}"
+    );
+    assert_eq!(hit.specificity, 0.5, "symbol-side specificity: {hit:?}");
+}
+
+#[test]
 fn near_set_is_a_pure_function_of_signature_not_intent() {
     // Issue #3: rewording ONLY the intent must not change the near set —
     // automated consumers (hooks/CI) cannot author a "good" intent.

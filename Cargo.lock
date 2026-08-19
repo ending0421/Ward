@@ -1824,7 +1824,7 @@ dependencies = [
 
 [[package]]
 name = "ward-bench"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -1836,7 +1836,7 @@ dependencies = [
 
 [[package]]
 name = "ward-cli"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -1851,7 +1851,7 @@ dependencies = [
 
 [[package]]
 name = "ward-core"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "anyhow",
  "blake3",
@@ -1874,7 +1874,7 @@ dependencies = [
 
 [[package]]
 name = "ward-mcp"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "anyhow",
  "rmcp",

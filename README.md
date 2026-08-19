@@ -105,6 +105,7 @@ top_k = 5                               # matches per advisory
 [thresholds]
 strong = 0.92   # initial value — recalibrate weekly against the golden set
 weak = 0.80
+specificity_floor = 0.5  # issue #5: signatures below this are never Strong
 
 [clusters]
 exclude_tests = true    # M6: skip #[cfg(test)] mod tests / tests/ near-dupes
@@ -178,7 +179,10 @@ cannot inject context from PreToolUse
 
 Pipeline: L1 equality → BM25 recall → L2 simhash ranking → thresholded
 grades. **Strong grades require fingerprint evidence**; text-only matches are
-capped at `weak` by construction.
+capped at `weak` by construction. **Low-specificity signatures** (all
+basic/std param types — issue #5) degrade to shape-only matches: they are
+returned for humans but flagged `low_confidence` and never graded Strong,
+so automated gates can ignore them by construction.
 
 ## More commands
 

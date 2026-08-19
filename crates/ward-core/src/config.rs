@@ -24,6 +24,10 @@ pub struct Thresholds {
     pub strong: f64,
     /// Weak suggestion: listed for reference only.
     pub weak: f64,
+    /// Signature specificity floor (issue #5): queries whose signature is
+    /// mostly basic/std types (specificity below this) return matches but
+    /// never grade above Weak — automated gates must ignore them.
+    pub specificity_floor: f64,
 }
 
 impl Default for Thresholds {
@@ -31,6 +35,7 @@ impl Default for Thresholds {
         Self {
             strong: 0.92,
             weak: 0.80,
+            specificity_floor: 0.5,
         }
     }
 }

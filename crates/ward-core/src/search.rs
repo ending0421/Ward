@@ -37,6 +37,10 @@ pub struct SpotMatch {
     /// `exact` (L0) | `structural` (L1) | `near` (L2 simhash) | `textual`
     /// (BM25 only — never graded strong).
     pub kind: String,
+    /// The MATCHED symbol's signature specificity (issue #5): fraction of
+    /// domain-typed params. Legacy payloads deserialize to 0.0.
+    #[serde(default)]
+    pub specificity: f64,
     pub note: String,
 }
 
@@ -47,6 +51,15 @@ pub struct SpotResult {
     pub stale: bool,
     pub matches: Vec<SpotMatch>,
     pub advisory_id: String,
+    /// The QUERY signature's specificity (issue #5): fraction of
+    /// domain-typed params. Legacy payloads deserialize to 0.0.
+    #[serde(default)]
+    pub query_specificity: f64,
+    /// True when query_specificity is below the configured floor: matches
+    /// are returned for humans but never graded Strong — automated gates
+    /// must treat the advisory as non-blocking.
+    #[serde(default)]
+    pub low_confidence: bool,
     /// The original intent text (added for label context; older advisories
     /// lack it and deserialize to `None`).
     #[serde(default)]
@@ -196,6 +209,27 @@ impl Bm25 {
     }
 }
 
+/// The matched symbol's own signature specificity (issue #5): parsed from
+/// the hit file on demand — only for the few kept matches.
+fn symbol_specificity(repo: &Path, m: &SpotMatch) -> f64 {
+    let Some(lang) = Language::from_path(Path::new(&m.path)) else {
+        return 0.0;
+    };
+    let Ok(source) = std::fs::read_to_string(repo.join(&m.path)) else {
+        return 0.0;
+    };
+    // Best-effort: the declaration usually starts on the first match line
+    // (multi-line signatures parse from a partial window → 0.0, honest).
+    let line_no: usize = m
+        .lines
+        .split('-')
+        .next()
+        .and_then(|l| l.parse().ok())
+        .unwrap_or(1);
+    let line = source.lines().nth(line_no.saturating_sub(1)).unwrap_or("");
+    crate::specificity::signature_specificity(lang, line).unwrap_or(0.0)
+}
+
 fn line_range(path: &Path, start_byte: i64, end_byte: i64) -> String {
     let Ok(source) = std::fs::read_to_string(path) else {
         return "?".into();
@@ -302,6 +336,17 @@ pub fn spot(
     let query_sim = parsed
         .as_ref()
         .and_then(|(lang, t)| fingerprint::signature_simhash(t, lang.spec()));
+    // Issue #5: low-specificity signatures (all basic/std param types)
+    // degenerate to shape-only fingerprints and flood false positives.
+    // Compute the specificity once and expose it + the gate flag.
+    let query_specificity = proposed_signature
+        .and_then(|sig| {
+            parsed
+                .as_ref()
+                .and_then(|(lang, _)| crate::specificity::signature_specificity(*lang, sig))
+        })
+        .unwrap_or(0.0);
+    let low_confidence = query_specificity < config.thresholds.specificity_floor;
 
     // Monorepo scope filter (spec §2.6): when the caller names a scope,
     // cross-scope hits are excluded — a Kotlin wrapper and the Rust core
@@ -326,6 +371,7 @@ pub fn spot(
                 lines: line_range(&repo.join(&sym.file_path), sym.start_byte, sym.end_byte),
                 symbol: sym.name.clone(),
                 similarity: 1.0,
+                specificity: 0.0,
                 kind: "structural".into(),
                 note: "结构全等（归一化后）：克隆/纯改名/字面量替换".into(),
             });
@@ -375,6 +421,7 @@ pub fn spot(
                         symbol: sym.name.clone(),
                         similarity: sim,
                         kind: "near".into(),
+                        specificity: 0.0,
                         note: String::new(),
                     },
                     sim,
@@ -419,6 +466,7 @@ pub fn spot(
                             symbol: sym.name.clone(),
                             similarity: sim,
                             kind: "textual".into(),
+                            specificity: 0.0,
                             note: String::new(),
                         },
                         sim,
@@ -429,8 +477,16 @@ pub fn spot(
     }
     ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
-    for (m, sim) in ranked {
-        if grade(&m.kind, sim, config) != Grade::Filtered {
+    for (mut m, sim) in ranked {
+        let mut g = grade(&m.kind, sim, config);
+        if low_confidence && g == Grade::Strong {
+            // Automated gates must not treat shape-only matches as
+            // blocking: returned, but capped at Weak (issue #5).
+            g = Grade::Weak;
+            m.note = "低特异度签名（基础类型为主）：仅弱提示，自动化门禁应忽略".into();
+        }
+        if g != Grade::Filtered {
+            m.specificity = symbol_specificity(repo, &m);
             matches.push(m);
         }
         if matches.len() >= config.top_k {
@@ -463,6 +519,7 @@ pub fn spot(
                             symbol: format!("block:{}", b.kind),
                             similarity: best,
                             kind: "block".into(),
+                            specificity: 0.0,
                             note: "函数内语句块窗口高度相似（块级指纹）".into(),
                         },
                         best,
@@ -505,6 +562,8 @@ pub fn spot(
         stale: fresh.stale,
         matches,
         advisory_id: advisory_id.clone(),
+        query_specificity,
+        low_confidence,
         query: Some(intent.to_string()),
     };
     // Store the FULL payload — the inference channel and the golden-set
@@ -536,6 +595,8 @@ pub fn parse_spot_payload(json: &str) -> Option<SpotResult> {
         stale: false,
         matches,
         advisory_id: String::new(),
+        query_specificity: 0.0,
+        low_confidence: false,
         query: None,
     })
 }

@@ -30,6 +30,7 @@ pub mod project;
 pub mod report;
 pub mod search;
 pub mod spec;
+pub mod specificity;
 pub mod spotfile;
 pub mod stats;
 pub mod store;
