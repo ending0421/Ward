@@ -19,6 +19,7 @@ pub fn default_path(repo_root: &Path) -> PathBuf {
 /// weekly recalibration against a human-labeled golden set (spec §3-M1).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
+#[non_exhaustive]
 pub struct Thresholds {
     /// Strong suggestion: "reuse or extend the existing implementation".
     pub strong: f64,
