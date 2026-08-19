@@ -59,14 +59,27 @@ fn run(cmd: &mut Command, timeout: Duration) -> Result<std::process::Output, Str
     // Drain both pipes on reader threads from spawn time: reading only after
     // the child exits deadlocks once it fills the OS pipe buffer (~64KiB on
     // macOS) — a real pass would be misreported as a timeout.
-    let mut child = match cmd
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-    {
-        Ok(c) => c,
-        Err(e) => return Err(format!("spawn failed: {e}")),
-    };
+    // Linux exec'ing a just-written shim can race with ETXTBSY/EAGAIN —
+    // retry briefly instead of misreporting a wiring gap (CI flake seen in
+    // the shim-based tests).
+    let mut child = None;
+    for attempt in 0..3 {
+        match cmd
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+        {
+            Ok(c) => {
+                child = Some(c);
+                break;
+            }
+            Err(e) if attempt < 2 && matches!(e.raw_os_error(), Some(26) | Some(11)) => {
+                std::thread::sleep(Duration::from_millis(20 * (attempt + 1)));
+            }
+            Err(e) => return Err(format!("spawn failed: {e}")),
+        }
+    }
+    let mut child = child.expect("spawn retried");
     let out_pipe = read_pipe(child.stdout.take());
     let err_pipe = read_pipe(child.stderr.take());
     let deadline = start + timeout;
