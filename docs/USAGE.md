@@ -123,7 +123,24 @@ FFI）。spec 断言加 `- kind: ffi_compat` 后，`form-check --ci` 会用 nm
 HIGH 风险标记：绑定是生成物，必须重新生成并人审。
 ```
 
-退出码约定：`1` = 裁决失败（红），`2` = 证据不足（unknown 不绿灯，也是红）。
+退出码约定：`1` = 裁决失败（红），`2` = 证据不足（unknown 不绿灯，也是红），
+**`3` = 无法诚实回答**（无索引/空索引/索引严重过期——`spot` 的 #6/#7 契约；
+结果 JSON 带 `index_state`/`stale_severe`/`stale_commits` 供机器判读）。
+gate 消费方应把 3 当"先刷新索引再放行"，绝不能当"无重复"。
+
+**边界契约速查（v0.7.0）**：
+- `spot` 不再自动建索引；linked worktree 无自有索引时自动共享主 checkout
+  的索引（`index_shared_from` 指明来源）；
+- `--quick`：低特异度签名不碰索引直接回答（`quick: true`）；低特异度谓词
+  已稳定：参数类型全部为基础/标准库类型即低特异度；
+- `--max-staleness-commits/-days`：超出即 `stale_severe` + exit 3；
+- ack 登记处（#9）：`ward ack --against <hit> --reason "..."`；spot 默认
+  不再返回已 ack 的命中（`--show-acked` 可见）；hook 自动回写
+  `ward-ack:`/`ward-converges:` 标记，零 Agent 配合；
+- `--consumes <symbol>`：本次编辑整合该符号 → 命中降级为信息性
+  （kind=consumed）并记录收敛事件；
+- `setup-hooks` 对已有 post-commit 采用 backup-and-chain
+  （`post-commit.pre-ward`），`--remove` 还原原件——不会踩坏 git-lfs。
 
 ## 5. 与 Claude Code / Codex 协作
 

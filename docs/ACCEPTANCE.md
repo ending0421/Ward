@@ -15,19 +15,19 @@
 | M6 整合重构 | 离线重复簇聚类 + 合并建议（PR 由人提交） | ✅ 完整（分析半部分；PR 创建按 P2 由人执行） |
 | 语言矩阵 | Rust/Kotlin/Swift/Java/ObjC + **UDL** + **模块作用域** | ✅ 五语法 + UDL 薄提取器；构建产物/清单文件默认忽略 |
 | 治理数据闭环 | 推断采纳通道 + 黄金集标注 + Wilson 校准 + 快照/报表 + 双标一致性（Fleiss κ） | ✅ 完整 |
-| 基础设施 | hooks、CI（含 jvm-smoke 真 validator / apple-smoke 真 digester）、回滚、性能基准、**CLI/MCP JSON 信封统一（#4）** | ✅ 完整 |
+| 基础设施 | hooks、CI（含 jvm-smoke 真 validator / apple-smoke 真 digester）、回滚、性能基准、CLI/MCP JSON 信封统一（#4）、**边界契约（#6-#11：index_state/exit 3/worktree 共享/--quick/ack 登记处/--consumes/backup-and-chain）** | ✅ 完整 |
 
 ## 2. 质量门禁（实测数字）
 
 | 指标 | 值 |
 | :--- | :--- |
-| 测试总数 | 237（2 bench + 9 CLI smoke + 179 lib unit + 46 e2e + 1 doc） |
+| 测试总数 | 251（2 bench + 11 CLI smoke + 184 lib unit + 53 e2e + 1 doc） |
 | clippy | `-D warnings` 零告警 |
 | rustfmt | 干净 |
-| 覆盖率（workspace） | 85.69% 行（llvm-cov，门禁 ≥85%） |
+| 覆盖率（workspace） | 85.62% 行（llvm-cov，门禁 ≥85%） |
 | 意义验证 | scripts/verify-meaningful.sh 11/11 |
 | 性能（F11 基线） | 10⁴：索引 7.5s / spot p99 25ms；10⁵：索引 11.9s / spot p99 73ms（near 全表扫描后余量 27%） |
-| 索引 schema | v7（symbols.module；F1 重建保留治理数据） |
+| 索引 schema | v8（symbols.module + acks 治理表；F1 重建保留治理数据） |
 
 ## 3. 设计边界（文档化的诚实声明，非缺失代码）
 

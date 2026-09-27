@@ -247,6 +247,67 @@ fn form_check_ci_posture_is_fail_closed() {
 }
 
 #[test]
+fn spot_exit_3_on_missing_index() {
+    // Issue #6/#7 boundary: "cannot answer honestly" is exit code 3.
+    let repo = repo_with_rust();
+    let out = ward(
+        &[
+            "spot",
+            "--repo",
+            ".",
+            "--intent",
+            "x",
+            "--signature",
+            "pub fn f() -> u8",
+            "--json",
+        ],
+        repo.path(),
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(3),
+        "missing index must exit 3: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let json: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).unwrap();
+    assert_eq!(json["data"]["index_state"], "missing");
+}
+
+#[test]
+fn setup_hooks_chains_existing_hook_and_restores_on_remove() {
+    // Issue #11: never clobber an existing post-commit (git-lfs class).
+    let repo = repo_with_rust();
+    let hook = repo.path().join(".git/hooks/post-commit");
+    std::fs::create_dir_all(hook.parent().unwrap()).unwrap();
+    std::fs::write(&hook, "#!/bin/sh\necho lfs-step\n").unwrap();
+    let out = ward(&["setup-hooks", "--repo", "."], repo.path());
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let content = std::fs::read_to_string(&hook).unwrap();
+    assert!(content.contains("WARD_HOOK_CHAIN"), "chain installed");
+    assert!(content.contains("ward infer"), "ward step present");
+    let pre = repo.path().join(".git/hooks/post-commit.pre-ward");
+    assert!(pre.exists(), "original preserved");
+    assert_eq!(
+        std::fs::read_to_string(&pre).unwrap(),
+        "#!/bin/sh\necho lfs-step\n"
+    );
+    // Remove restores the original.
+    let out = ward(&["setup-hooks", "--repo", ".", "--remove"], repo.path());
+    assert!(out.status.success());
+    assert_eq!(
+        std::fs::read_to_string(&hook).unwrap(),
+        "#!/bin/sh\necho lfs-step\n",
+        "original restored on remove"
+    );
+    assert!(!pre.exists());
+}
+
+#[test]
 fn setup_hooks_and_infer_roundtrip() {
     let repo = repo_with_rust();
     let out = ward(&["setup-hooks", "--repo", "."], repo.path());

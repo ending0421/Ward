@@ -184,6 +184,23 @@ basic/std param types — issue #5) degrade to shape-only matches: they are
 returned for humans but flagged `low_confidence` and never graded Strong,
 so automated gates can ignore them by construction.
 
+## Consumer boundary contract (v0.7.0)
+
+Gates consume `spot` as JSON + exit codes — silence must never mean absence:
+
+| Signal | Meaning |
+| :--- | :--- |
+| `index_state: "missing"/"empty"` + exit 3 | no index / empty index — **not** "no duplicates" |
+| `stale_severe: true` + exit 3 | staleness floor exceeded (`--max-staleness-*`) — refresh first |
+| `repo_root` / `index_shared_from` | absolute root of `match.path`; worktree sharing source |
+| `quick: true` | answered by the `--quick` fast path (index untouched) |
+| `low_confidence: true` | low-specificity signature — never Strong |
+| ack registry | `ward ack --against <hit>`; hits acked once stay suppressed (`--show-acked`) |
+| `--consumes <symbol>` | consolidation edits demote to `kind: consumed` |
+
+`ward setup-hooks` chains (never clobbers) an existing post-commit
+(`post-commit.pre-ward`, restore on `--remove`).
+
 ## More commands
 
 ```bash

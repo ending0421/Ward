@@ -98,6 +98,63 @@ PYEOF
 fi
 rm -f "$hits_file"
 
+# Issue #9/#10: escape-hatch markers are recorded BY THE HOOK — zero agent
+# cooperation, the registry learns at decision time.
+markers_file="$(mktemp)"
+python3 - "$tool_input_json" "$markers_file" <<'PYEOF'
+import json, sys
+tool_input_json, markers_file = sys.argv[1:3]
+try:
+    data = json.loads(tool_input_json)
+except Exception:
+    sys.exit(0)
+paths = []
+if isinstance(data.get("file_path"), str):
+    paths.append(data["file_path"])
+for edit in data.get("edits") or []:
+    p = edit.get("file_path")
+    if isinstance(p, str):
+        paths.append(p)
+records = []
+for p in list(dict.fromkeys(paths))[:5]:
+    try:
+        with open(p, "r", encoding="utf-8", errors="replace") as f:
+            text = f.read()
+    except Exception:
+        continue
+    for line in text.splitlines():
+        for marker, kind in (("ward-ack:", "ack"), ("ward-converges:", "converges")):
+            if marker in line:
+                for chunk in line.split(marker)[1:]:
+                    name = chunk.strip().split()[0] if chunk.strip() else ""
+                    name = name.rstrip("*/")
+                    if name:
+                        records.append((kind, name))
+if records:
+    with open(markers_file, "w", encoding="utf-8") as f:
+        json.dump(records, f)
+PYEOF
+if [ -s "$markers_file" ]; then
+  python3 - "$markers_file" "$WARD_BIN" "$REPO_ROOT" <<'PYEOF'
+import json, subprocess, sys
+markers_file, ward_bin, repo_root = sys.argv[1:4]
+records = json.load(open(markers_file, encoding="utf-8"))
+seen = set()
+for kind, name in records:
+    if (kind, name) in seen:
+        continue
+    seen.add((kind, name))
+    try:
+        subprocess.run(
+            [ward_bin, "ack", "--against", name, "--kind", kind,
+             "--reason", "marker", "--repo", repo_root],
+            capture_output=True, text=True, timeout=20)
+    except Exception:
+        pass
+PYEOF
+fi
+rm -f "$markers_file"
+
 # Refresh the index so the NEXT write diffs against this state.
 "$WARD_BIN" index --repo "$REPO_ROOT" >/dev/null 2>&1 || true
 exit 0

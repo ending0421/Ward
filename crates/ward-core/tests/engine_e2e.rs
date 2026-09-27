@@ -183,13 +183,15 @@ fn module_scoping_partitions_symbols_and_filters_spot() {
     let sig = "pub fn push_fill_quad(rect: &Rect, color: u32)";
     let scoped = search::spot(
         repo.path(),
-        &store,
         &cfg(),
         "x",
         Some(sig),
         None,
         Some(Language::Rust),
-        Some("engine-core"),
+        &search::SpotOptions {
+            scope: Some("engine-core".into()),
+            ..Default::default()
+        },
     )
     .unwrap();
     assert!(
@@ -199,13 +201,15 @@ fn module_scoping_partitions_symbols_and_filters_spot() {
     );
     let unscoped = search::spot(
         repo.path(),
-        &store,
         &cfg(),
         "x",
         Some(sig),
         None,
         Some(Language::Rust),
-        None,
+        &search::SpotOptions {
+            scope: None,
+            ..Default::default()
+        },
     )
     .unwrap();
     assert!(
@@ -310,18 +314,19 @@ fn spot_resolves_kotlin_signatures_structurally() {
     );
     repo.commit_all("c1");
     index::index_repo(repo.path(), &cfg()).unwrap();
-    let store = Store::open(&Store::default_path(repo.path())).unwrap();
 
     // Signature-only query: detected as Kotlin, strong fingerprint match.
     let r = search::spot(
         repo.path(),
-        &store,
         &cfg(),
         "防抖函数",
         Some("fun debounce(f: (Long) -> Unit, ms: Long): Unit"),
         None,
         None,
-        None,
+        &search::SpotOptions {
+            scope: None,
+            ..Default::default()
+        },
     )
     .unwrap();
     let hit = r
@@ -339,13 +344,15 @@ fn spot_resolves_kotlin_signatures_structurally() {
     // Explicit language hint must not break the same query.
     let r2 = search::spot(
         repo.path(),
-        &store,
         &cfg(),
         "防抖函数",
         Some("fun debounce(f: (Long) -> Unit, ms: Long): Unit"),
         None,
         Some(Language::Kotlin),
-        None,
+        &search::SpotOptions {
+            scope: None,
+            ..Default::default()
+        },
     )
     .unwrap();
     assert!(r2.matches.iter().any(|m| m.symbol == "debounce"));
@@ -356,16 +363,17 @@ fn spot_resolves_kotlin_signatures_structurally() {
     rust_repo.write("src/only.rs", "pub fn unrelated() -> u8 { 1 }");
     rust_repo.commit_all("c1");
     index::index_repo(rust_repo.path(), &cfg()).unwrap();
-    let rust_store = Store::open(&Store::default_path(rust_repo.path())).unwrap();
     let r3 = search::spot(
         rust_repo.path(),
-        &rust_store,
         &cfg(),
         "防抖函数",
         Some("fun debounce(f: (Long) -> Unit, ms: Long): Unit"),
         None,
         None,
-        None,
+        &search::SpotOptions {
+            scope: None,
+            ..Default::default()
+        },
     )
     .unwrap();
     assert!(
@@ -534,13 +542,15 @@ fn spot_finds_structural_match_end_to_end() {
     let store = Store::open(&Store::default_path(repo.path())).unwrap();
     let r = search::spot(
         repo.path(),
-        &store,
         &cfg(),
         "防抖函数",
         Some("pub fn debounce(f: &dyn Fn(u64), ms: u64) -> u8"),
         None,
         None,
-        None,
+        &search::SpotOptions {
+            scope: None,
+            ..Default::default()
+        },
     )
     .unwrap();
     assert!(!r.stale);
@@ -562,18 +572,19 @@ fn spot_l1_structural_equality_when_signature_is_full_body() {
     repo.write("src/lib.rs", &format!("{fn_src}\n"));
     repo.commit_all("c1");
     index::index_repo(repo.path(), &cfg()).unwrap();
-    let store = Store::open(&Store::default_path(repo.path())).unwrap();
     // Passing the *complete* function as the signature hits the L1 exact
     // structural-equality layer (normalized full-tree hash).
     let r = search::spot(
         repo.path(),
-        &store,
         &cfg(),
         "防抖",
         Some(fn_src),
         None,
         None,
-        None,
+        &search::SpotOptions {
+            scope: None,
+            ..Default::default()
+        },
     )
     .unwrap();
     assert!(
@@ -666,6 +677,247 @@ fn replay_skips_non_code_files() {
 }
 
 #[test]
+fn unindexed_repo_answers_missing_and_never_creates_an_index() {
+    // Issue #6: "not indexed" must be machine-readable and must NOT
+    // auto-create an empty index that certifies absence.
+    let repo = TestRepo::new();
+    repo.write("src/lib.rs", "pub fn f() {}\n");
+    repo.commit_all("c1");
+    let r = search::spot(
+        repo.path(),
+        &cfg(),
+        "x",
+        Some("pub fn f() -> u8"),
+        None,
+        Some(Language::Rust),
+        &search::SpotOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(r.index_state, "missing");
+    assert_eq!(r.matches.len(), 0);
+    assert_eq!(r.symbol_count, 0);
+    assert!(
+        !repo.path().join(".ward/index.db").exists(),
+        "spot must never create an index (issue #6)"
+    );
+    assert!(!r.repo_root.is_empty());
+}
+
+#[test]
+fn quick_path_answers_low_specificity_without_an_index() {
+    // Issue #8: the fast path decides from the signature alone.
+    let repo = TestRepo::new();
+    repo.write("src/lib.rs", "pub fn f() {}\n");
+    repo.commit_all("c1");
+    let options = search::SpotOptions {
+        quick: true,
+        ..Default::default()
+    };
+    let r = search::spot(
+        repo.path(),
+        &cfg(),
+        "x",
+        Some("pub fn debounce(f: &dyn Fn(u64), ms: u64) -> u8"),
+        None,
+        Some(Language::Rust),
+        &options,
+    )
+    .unwrap();
+    assert!(r.quick);
+    assert_eq!(r.index_state, "unchecked");
+    assert!(r.low_confidence);
+    assert!(!repo.path().join(".ward/index.db").exists());
+}
+
+#[test]
+fn linked_worktree_shares_the_main_checkout_index() {
+    // Issue #6: a linked worktree without its own index transparently uses
+    // the main checkout's — zero setup, correct answers.
+    let repo = TestRepo::new();
+    repo.write("src/lib.rs", "pub fn build_slot_fill(rect: &Rect, scale: f32) -> f32 { rect.x + scale }\npub struct Rect { pub x: f32, pub y: f32 }\n");
+    repo.commit_all("c1");
+    index::index_repo(repo.path(), &cfg()).unwrap();
+
+    let wt_root = repo.path().parent().unwrap().join(format!(
+        "{}-wt",
+        repo.path().file_name().unwrap().to_string_lossy()
+    ));
+    let out = std::process::Command::new("git")
+        .args(["worktree", "add", "-q", "-b", "wtbranch"])
+        .arg(&wt_root)
+        .current_dir(repo.path())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!wt_root.join(".ward").exists(), "worktree has no own index");
+
+    let r = search::spot(
+        &wt_root,
+        &cfg(),
+        "slot fill",
+        Some("pub fn build_slot_fill(rect: &Rect, scale: f32) -> f32"),
+        None,
+        Some(Language::Rust),
+        &search::SpotOptions::default(),
+    )
+    .unwrap();
+    assert!(
+        r.index_shared_from.is_some(),
+        "worktree must share the main index: {r:?}"
+    );
+    assert_eq!(r.index_state, "fresh");
+    assert!(
+        r.matches.iter().any(|m| m.symbol == "build_slot_fill"),
+        "shared index must answer: {:?}",
+        r.matches
+    );
+}
+
+#[test]
+fn ack_registry_suppresses_hits_until_shown() {
+    // Issue #9: one recorded decision stops re-litigation at every site.
+    let repo = TestRepo::new();
+    repo.write(
+        "src/lib.rs",
+        "pub fn push_segment(from: u32, to: u32) -> u8 { 0 }\npub fn other_thing(x: u32, y: u32) -> u8 { 0 }\n",
+    );
+    repo.commit_all("c1");
+    index::index_repo(repo.path(), &cfg()).unwrap();
+    let (store, _) = ward_core::store::Store::open_for_query(repo.path()).unwrap();
+    store
+        .record_ack(&ward_core::store::Ack {
+            id: None,
+            new_symbol: "push_segment_v2".into(),
+            hit_symbol: "push_segment".into(),
+            hit_path: None,
+            reason: "stroke sampler, not reusable".into(),
+            advisory_id: None,
+            kind: "ack".into(),
+            ts: 1,
+        })
+        .unwrap();
+    let r = search::spot(
+        repo.path(),
+        &cfg(),
+        "x",
+        Some("pub fn push_segment(from: u32, to: u32) -> u8"),
+        None,
+        Some(Language::Rust),
+        &search::SpotOptions::default(),
+    )
+    .unwrap();
+    assert!(
+        r.matches.iter().all(|m| m.symbol != "push_segment"),
+        "acked hit must be suppressed: {:?}",
+        r.matches
+    );
+    let r = search::spot(
+        repo.path(),
+        &cfg(),
+        "x",
+        Some("pub fn push_segment(from: u32, to: u32) -> u8"),
+        None,
+        Some(Language::Rust),
+        &search::SpotOptions {
+            show_acked: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert!(
+        r.matches.iter().any(|m| m.symbol == "push_segment"),
+        "--show-acked must reveal it: {:?}",
+        r.matches
+    );
+}
+
+#[test]
+fn consumes_demotes_and_records_convergence() {
+    // Issue #10: declaring the edit consumes the hit turns the block into
+    // the consolidation nudge and records a convergence event.
+    let repo = TestRepo::new();
+    repo.write(
+        "src/lib.rs",
+        "pub fn polyline_from_stroke(points: &[f32]) -> u8 { 0 }\n",
+    );
+    repo.commit_all("c1");
+    index::index_repo(repo.path(), &cfg()).unwrap();
+    let r = search::spot(
+        repo.path(),
+        &cfg(),
+        "shared helper",
+        Some("pub fn polyline_from_stroke(points: &[f32]) -> u8"),
+        None,
+        Some(Language::Rust),
+        &search::SpotOptions {
+            consumes: Some("polyline_from_stroke".into()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let hit = r
+        .matches
+        .iter()
+        .find(|m| m.symbol == "polyline_from_stroke");
+    assert!(
+        hit.is_some(),
+        "consumed hit is still returned: {:?}",
+        r.matches
+    );
+    assert_eq!(hit.unwrap().kind, "consumed");
+    let (store, _) = ward_core::store::Store::open_for_query(repo.path()).unwrap();
+    assert_eq!(store.ack_count().unwrap(), 1, "convergence event recorded");
+    assert_eq!(store.all_acks().unwrap()[0].kind, "converges");
+}
+
+#[test]
+fn staleness_severity_escalates_over_a_floor() {
+    // Issue #7: the freshness floor is a machine contract (exit code at
+    // the CLI boundary; stale_severe in the payload).
+    let repo = TestRepo::new();
+    repo.write("src/lib.rs", "pub fn a() {}\n");
+    repo.commit_all("c1");
+    index::index_repo(repo.path(), &cfg()).unwrap();
+    // Two commits after the index snapshot.
+    repo.write("src/b.rs", "pub fn b() {}\n");
+    repo.commit_all("c2");
+    repo.write("src/c.rs", "pub fn c() {}\n");
+    repo.commit_all("c3");
+
+    let r = search::spot(
+        repo.path(),
+        &cfg(),
+        "x",
+        Some("pub fn z() -> u8"),
+        None,
+        Some(Language::Rust),
+        &search::SpotOptions::default(),
+    )
+    .unwrap();
+    assert!(r.stale, "index is 2 commits behind");
+    assert_eq!(r.stale_commits, Some(2));
+
+    let r = search::spot(
+        repo.path(),
+        &cfg(),
+        "x",
+        Some("pub fn z() -> u8"),
+        None,
+        Some(Language::Rust),
+        &search::SpotOptions {
+            max_staleness_commits: Some(1),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert!(r.stale_severe, "floor exceeded must escalate");
+}
+
+#[test]
 fn low_specificity_signatures_are_flagged_and_never_strong() {
     // Issue #5: all-basic-type signatures degenerate to shape-only matches
     // (34/34 FP in the issue golden set). They must still be RETURNED for
@@ -678,16 +930,17 @@ fn low_specificity_signatures_are_flagged_and_never_strong() {
     );
     repo.commit_all("c1");
     index::index_repo(repo.path(), &cfg()).unwrap();
-    let store = Store::open(&Store::default_path(repo.path())).unwrap();
     let r = search::spot(
         repo.path(),
-        &store,
         &cfg(),
         "pre-edit duplicate check",
         Some("pub fn debounce(f: &dyn Fn(u64), ms: u64) -> u8"),
         None,
         Some(Language::Rust),
-        None,
+        &search::SpotOptions {
+            scope: None,
+            ..Default::default()
+        },
     )
     .unwrap();
     assert_eq!(r.query_specificity, 0.0);
@@ -710,16 +963,17 @@ fn low_specificity_signatures_are_flagged_and_never_strong() {
     );
     repo.commit_all("c2");
     index::index_repo(repo.path(), &cfg()).unwrap();
-    let store = Store::open(&Store::default_path(repo.path())).unwrap();
     let r = search::spot(
         repo.path(),
-        &store,
         &cfg(),
         "geometry",
         Some("pub fn push_fill(rect: &ModelRect, color: u32) -> u8"),
         None,
         Some(Language::Rust),
-        None,
+        &search::SpotOptions {
+            scope: None,
+            ..Default::default()
+        },
     )
     .unwrap();
     assert!(r.query_specificity >= 0.5, "domain-typed query: {r:?}");
@@ -748,31 +1002,34 @@ fn near_set_is_a_pure_function_of_signature_not_intent() {
     );
     repo.commit_all("c1");
     index::index_repo(repo.path(), &cfg()).unwrap();
-    let store = Store::open(&Store::default_path(repo.path())).unwrap();
     let sig = "pub fn push_rounded_rect(rect: &Rect, color: u32)";
     let body = "tessellate(rect); paint(color)";
     let intent_a = "new Rust function push_rounded_rect with signature: pub fn push_rounded_rect(rect: &Rect, color: u32) — being added to the engine renderer";
     let intent_b = "pre-edit duplicate check for Rust code being written in the engine";
     let r_a = search::spot(
         repo.path(),
-        &store,
         &cfg(),
         intent_a,
         Some(sig),
         Some(body),
         Some(Language::Rust),
-        None,
+        &search::SpotOptions {
+            scope: None,
+            ..Default::default()
+        },
     )
     .unwrap();
     let r_b = search::spot(
         repo.path(),
-        &store,
         &cfg(),
         intent_b,
         Some(sig),
         Some(body),
         Some(Language::Rust),
-        None,
+        &search::SpotOptions {
+            scope: None,
+            ..Default::default()
+        },
     )
     .unwrap();
     let near_of = |r: &ward_core::search::SpotResult| -> Vec<(String, f64)> {
@@ -803,16 +1060,17 @@ fn spot_block_layer_matches_body_windows() {
     repo.write("src/one.rs", &format!("fn one() {{ {body} }}"));
     repo.commit_all("c1");
     index::index_repo(repo.path(), &cfg()).unwrap();
-    let store = Store::open(&Store::default_path(repo.path())).unwrap();
     let r = search::spot(
         repo.path(),
-        &store,
         &cfg(),
         "一样的语句序列",
         None,
         Some(body),
         None,
-        None,
+        &search::SpotOptions {
+            scope: None,
+            ..Default::default()
+        },
     )
     .unwrap();
     assert!(
@@ -828,16 +1086,17 @@ fn spot_without_signature_is_weak_never_strong() {
     repo.write("src/lib.rs", "pub fn debounce() {}");
     repo.commit_all("c1");
     index::index_repo(repo.path(), &cfg()).unwrap();
-    let store = Store::open(&Store::default_path(repo.path())).unwrap();
     let r = search::spot(
         repo.path(),
-        &store,
         &cfg(),
         "debounce",
         None,
         None,
         None,
-        None,
+        &search::SpotOptions {
+            scope: None,
+            ..Default::default()
+        },
     )
     .unwrap();
     for m in &r.matches {
@@ -855,8 +1114,16 @@ fn spot_respects_suppression_and_top_k() {
     let mut cfg = cfg();
     cfg.suppress = vec!["vendor/".into()];
     index::index_repo(repo.path(), &cfg).unwrap();
-    let store = Store::open(&Store::default_path(repo.path())).unwrap();
-    let r = search::spot(repo.path(), &store, &cfg, "alpha", None, None, None, None).unwrap();
+    let r = search::spot(
+        repo.path(),
+        &cfg,
+        "alpha",
+        None,
+        None,
+        None,
+        &search::SpotOptions::default(),
+    )
+    .unwrap();
     assert!(r.matches.iter().all(|m| !m.path.starts_with("vendor")));
 }
 
@@ -880,16 +1147,17 @@ fn spot_top_k_truncates_textual_matches() {
     }
     repo.commit_all("c1");
     index::index_repo(repo.path(), &cfg()).unwrap();
-    let store = Store::open(&Store::default_path(repo.path())).unwrap();
     let r = search::spot(
         repo.path(),
-        &store,
         &cfg(),
         "alpha bravo charlie delta echo",
         None,
         None,
         None,
-        None,
+        &search::SpotOptions {
+            scope: None,
+            ..Default::default()
+        },
     )
     .unwrap();
     assert_eq!(r.matches.len(), 5, "top_k must truncate: {:?}", r.matches);
@@ -924,16 +1192,17 @@ fn spot_on_empty_index_fails_open() {
     repo.write("src/lib.rs", "pub fn f() {}");
     repo.commit_all("c1");
     // Never indexed: store exists but is empty.
-    let store = Store::open(&Store::default_path(repo.path())).unwrap();
     let r = search::spot(
         repo.path(),
-        &store,
         &cfg(),
         "whatever",
         None,
         None,
         None,
-        None,
+        &search::SpotOptions {
+            scope: None,
+            ..Default::default()
+        },
     )
     .unwrap();
     assert!(r.matches.is_empty());
