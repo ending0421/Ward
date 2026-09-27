@@ -1,4 +1,4 @@
-# Ward 交付验收清单（v0.5.0 实测版）
+# Ward 交付验收清单（v0.8.0 实测版）
 
 对照设计规格 `docs/ward-tech-spec-v0.6.1.md` 的逐项实现核对。
 （历史版本：v0.1.0 / v0.4.0 版数字见 git 历史。）
@@ -14,20 +14,20 @@
 | M5 Context Cards | 定义 + 调用方 + 相关测试 + 配置引用 | ✅ 完整 |
 | M6 整合重构 | 离线重复簇聚类 + 合并建议（PR 由人提交） | ✅ 完整（分析半部分；PR 创建按 P2 由人执行） |
 | 语言矩阵 | Rust/Kotlin/Swift/Java/ObjC + **UDL** + **模块作用域** | ✅ 五语法 + UDL 薄提取器；构建产物/清单文件默认忽略 |
-| 治理数据闭环 | 推断采纳通道 + 黄金集标注 + Wilson 校准 + 快照/报表 + 双标一致性（Fleiss κ） | ✅ 完整 |
-| 基础设施 | hooks、CI（含 jvm-smoke 真 validator / apple-smoke 真 digester）、回滚、性能基准、CLI/MCP JSON 信封统一（#4）、**边界契约（#6-#11：index_state/exit 3/worktree 共享/--quick/ack 登记处/--consumes/backup-and-chain）** | ✅ 完整 |
+| 治理数据闭环 | 推断采纳通道 + 黄金集标注 + Wilson 校准 + 快照/报表 + 双标一致性（Fleiss κ）+ **转化率漏斗（#13）** | ✅ 完整（`ward stats --funnel`：acked/reused/rewritten/pending/abandoned 分桶与周 cohort） |
+| 基础设施 | hooks、CI（含 jvm-smoke 真 validator / apple-smoke 真 digester）、回滚、性能基准、CLI/MCP JSON 信封统一（#4）、边界契约（#6-#11）、**召回保真（#12-#16：worktree provenance/逐字复制自匹配/裸类型特异度/漏斗/MCP ack+infer）** | ✅ 完整 |
 
 ## 2. 质量门禁（实测数字）
 
 | 指标 | 值 |
 | :--- | :--- |
-| 测试总数 | 251（2 bench + 11 CLI smoke + 184 lib unit + 53 e2e + 1 doc） |
+| 测试总数 | 258（2 bench + 11 CLI smoke + 188 lib unit + 56 e2e + 1 doc） |
 | clippy | `-D warnings` 零告警 |
 | rustfmt | 干净 |
-| 覆盖率（workspace） | 85.62% 行（llvm-cov，门禁 ≥85%） |
+| 覆盖率（workspace） | 85.7% 行（llvm-cov，门禁 ≥85%） |
 | 意义验证 | scripts/verify-meaningful.sh 11/11 |
 | 性能（F11 基线） | 10⁴：索引 7.5s / spot p99 25ms；10⁵：索引 11.9s / spot p99 73ms（near 全表扫描后余量 27%） |
-| 索引 schema | v8（symbols.module + acks 治理表；F1 重建保留治理数据） |
+| 索引 schema | v9（symbols.module + worktree/worktree_branch provenance + acks 治理表；F1 重建保留治理数据，v8→v9 首次打开自动重建） |
 
 ## 3. 设计边界（文档化的诚实声明，非缺失代码）
 
@@ -42,4 +42,5 @@
 
 - 仓库：`git@github.com:ending0421/Ward.git`，分支 `master`；
 - 最小颗粒度提交：180+ 次（AI 提交带 `[ai]` 标记 + Co-authored-by）；
-- 版本纪律：0.4.x 仅 hotfix，0.5.0 = 多平台语言矩阵里程碑。
+- 版本纪律：0.x 的 minor 位承担"破坏性变更"语义（0.7.0 边界契约、0.8.0 召回保真），
+  patch 位仅 hotfix；契约字段只增不改，且同一批次的破坏性变更与版本号同一次提交落地。

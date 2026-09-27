@@ -78,6 +78,12 @@ enum Cmd {
     Index {
         #[arg(default_value = ".", long)]
         repo: PathBuf,
+        /// Also index LINKED WORKTREES' unmerged files (issue #12). Off by
+        /// default: committed symbols are shared through the main index, and
+        /// only `/worktree`-local work needs collecting. Turning this back
+        /// off purges worktree provenance on the next run.
+        #[arg(long)]
+        include_worktrees: bool,
     },
     /// Pre-generation duplicate check (M1 Spot)
     Spot {
@@ -226,6 +232,10 @@ enum Cmd {
         repo: PathBuf,
         #[arg(long)]
         json: bool,
+        /// Also print the deny→outcome conversion funnel (issue #13):
+        /// acked / reused / rewritten / pending / abandoned.
+        #[arg(long)]
+        funnel: bool,
     },
     /// Background unattended worker: watch→index, poll→infer, daily
     /// snapshot, weekly metrics (无感模式)
@@ -401,8 +411,14 @@ fn main() -> Result<()> {
             config::write_starter_config(&path)?;
             println!("wrote {}", path.display());
         }
-        Cmd::Index { repo } => {
-            let cfg = load_config(&repo);
+        Cmd::Index {
+            repo,
+            include_worktrees,
+        } => {
+            let mut cfg = load_config(&repo);
+            if include_worktrees {
+                cfg.index.include_worktrees = true;
+            }
             let report = index::index_repo(&repo, &cfg)?;
             println!(
                 "indexed {} files / {} symbols ({} unchanged, {} skipped-language, {} unparsable, {} suppressed) at {:?}",
@@ -414,6 +430,12 @@ fn main() -> Result<()> {
                 report.files_suppressed,
                 report.commit_sha.as_deref().unwrap_or("uncommitted")
             );
+            if cfg.index.include_worktrees {
+                println!(
+                    "worktrees: {} files / {} symbols (unmerged provenance)",
+                    report.worktree_files_indexed, report.worktree_symbols_indexed
+                );
+            }
         }
         Cmd::Spot {
             intent,
@@ -909,14 +931,36 @@ fn main() -> Result<()> {
                 );
             }
         }
-        Cmd::Stats { repo, json } => {
+        Cmd::Stats { repo, json, funnel } => {
             let store = open_store(&repo)?;
             let cfg = load_config(&repo);
             let report = ward_core::stats::stats(&repo, &store, &cfg)?;
+            let funnel_report = if funnel {
+                Some(ward_core::funnel::funnel_report(
+                    &store,
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs() as i64)
+                        .unwrap_or_default(),
+                )?)
+            } else {
+                None
+            };
             if json {
-                print_json(&report)?;
+                match &funnel_report {
+                    Some(f) => print_json(&serde_json::json!({
+                        "stats": report,
+                        "funnel": f,
+                    }))?,
+                    None => print_json(&report)?,
+                }
             } else {
                 print!("{}", ward_core::stats::render_table(&report));
+                if let Some(f) = &funnel_report {
+                    println!();
+                    print!("{}", ward_core::funnel::render_funnel(f));
+                    println!();
+                }
             }
         }
         Cmd::Doctor {

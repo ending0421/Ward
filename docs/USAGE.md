@@ -128,7 +128,7 @@ HIGH 风险标记：绑定是生成物，必须重新生成并人审。
 结果 JSON 带 `index_state`/`stale_severe`/`stale_commits` 供机器判读）。
 gate 消费方应把 3 当"先刷新索引再放行"，绝不能当"无重复"。
 
-**边界契约速查（v0.7.0）**：
+**边界契约速查（v0.8.0）**：
 - `spot` 不再自动建索引；linked worktree 无自有索引时自动共享主 checkout
   的索引（`index_shared_from` 指明来源）；
 - `--quick`：低特异度签名不碰索引直接回答（`quick: true`）；低特异度谓词
@@ -140,11 +140,20 @@ gate 消费方应把 3 当"先刷新索引再放行"，绝不能当"无重复"�
 - `--consumes <symbol>`：本次编辑整合该符号 → 命中降级为信息性
   （kind=consumed）并记录收敛事件；
 - `setup-hooks` 对已有 post-commit 采用 backup-and-chain
-  （`post-commit.pre-ward`），`--remove` 还原原件——不会踩坏 git-lfs。
+  （`post-commit.pre-ward`），`--remove` 还原原件——不会踩坏 git-lfs；
+- worktree 未合并来源（#12）：`ward index --include-worktrees`（或
+  `[index] include_worktrees = true`）收集 linked worktree 相对 merge-base
+  的新增/变更文件；命中带 `worktree`（绝对根）+ `worktree_branch`（分支名），
+  note 标注 `未合并来源（worktree <目录>@<分支>）（#12）`，`worktree_symbols`
+  给出计数；行号与 per-file 哈希按 worktree 根解析（不会把结果拖成 stale）；
+  worktree 删除后条目自动清理；不带开关的索引会清空 provenance
+  （hook 始终带开关，静默路径无需人工）；
+- 转化率报表（#13）：`ward stats --funnel` 输出 `acked/reused/rewritten/
+  pending/abandoned` 分桶与周 cohort 转化率。
 
 ## 5. 与 Claude Code / Codex 协作
 
-装好 MCP 后，Agent 会获得 10 个工具。**给 Agent 的正确指令**（写进项目规则文件）：
+装好 MCP 后，Agent 会获得 12 个工具。**给 Agent 的正确指令**（写进项目规则文件）：
 
 ```text
 - 写任何新函数前：调用 ward spot（intent + 拟写签名），

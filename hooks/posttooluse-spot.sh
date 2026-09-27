@@ -33,7 +33,7 @@ fi
 if [ ! -f "$REPO_ROOT/.ward/index.db" ]; then
   # First run ever: nothing to compare against yet. Build the index once so
   # the next writes get real checks; do NOT check this write (fail-open).
-  "$WARD_BIN" index --repo "$REPO_ROOT" >/dev/null 2>&1 || true
+  "$WARD_BIN" index --repo "$REPO_ROOT" --include-worktrees >/dev/null 2>&1 || true
   exit 0
 fi
 
@@ -78,9 +78,18 @@ for p in list(dict.fromkeys(paths))[:5]:
     for adv in (report.get("data") or {}).get("advisories") or []:
         for m in adv.get("matches") or []:
             if m.get("similarity", 0) >= 0.92:
+                # Issue #12: a hit collected from a linked worktree is real
+                # but unmerged — say where it lives, or the agent will hunt
+                # for the path in the main checkout and find nothing.
+                prov = ""
+                if m.get("worktree"):
+                    name = os.path.basename(m["worktree"])
+                    br = m.get("worktree_branch") or ""
+                    label = f"{name}@{br}" if br else name
+                    prov = f'（worktree {label}，未合并来源）'
                 hits.append(
                     f'{rel} → {m["path"]}:{m["lines"]} {m["symbol"]}'
-                    f' [{m["kind"]} {m["similarity"]:.2f}]'
+                    f' [{m["kind"]} {m["similarity"]:.2f}]{prov}'
                 )
 if hits:
     with open(hits_file, "w", encoding="utf-8") as f:
@@ -156,5 +165,7 @@ fi
 rm -f "$markers_file"
 
 # Refresh the index so the NEXT write diffs against this state.
-"$WARD_BIN" index --repo "$REPO_ROOT" >/dev/null 2>&1 || true
+# `--include-worktrees` (issue #12): worktree-local files are the ones an
+# agent duplicates most often, and collecting them must not need a human.
+"$WARD_BIN" index --repo "$REPO_ROOT" --include-worktrees >/dev/null 2>&1 || true
 exit 0

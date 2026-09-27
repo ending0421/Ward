@@ -117,6 +117,29 @@ pub struct ClustersParams {
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct AckParams {
+    /// The new symbol being written (optional).
+    pub new: Option<String>,
+    /// The hit symbol the decision is against (required).
+    pub against: String,
+    /// The hit's path, when known.
+    pub path: Option<String>,
+    /// One-line rationale (audited in ward stats).
+    pub reason: Option<String>,
+    /// "ack" (not reusable from this site) | "converges" (this edit
+    /// consolidates the hit). Defaults to "ack".
+    pub kind: Option<String>,
+    /// The advisory this decision came from.
+    pub advisory: Option<String>,
+    pub repo: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct InferParams {
+    pub repo: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct SpotActionParams {
     pub advisory_id: String,
     /// accepted | ignored | dismissed
@@ -351,6 +374,61 @@ impl WardMcp {
         match result {
             Ok(r) => tool_ok(r),
             Err(e) => tool_err(format!("clusters failed (fail-open): {e}")),
+        }
+    }
+
+    /// Record an ack-registry entry (issue #14): MCP-only hosts could read
+    /// spot results but never close the loop into the registry that
+    /// suppresses future hits.
+    #[tool(
+        description = "Record an ack-registry entry: 'the hit is not reusable from this site' (kind=ack) or 'this edit consolidates the hit' (kind=converges). Spot stops returning acked hits by default."
+    )]
+    fn ack(&self, Parameters(p): Parameters<AckParams>) -> String {
+        let repo = resolve_repo(p.repo);
+        let result = (|| -> anyhow::Result<ward_core::store::Ack> {
+            let (store, _shared) = ward_core::store::Store::open_for_query(&repo)?;
+            let entry = ward_core::store::Ack {
+                id: None,
+                new_symbol: p.new.clone().unwrap_or_default(),
+                hit_symbol: p.against.clone(),
+                hit_path: p.path.clone(),
+                reason: p.reason.clone().unwrap_or_default(),
+                advisory_id: p.advisory.clone(),
+                kind: p.kind.clone().unwrap_or_else(|| "ack".into()),
+                ts: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or_default(),
+            };
+            store.record_ack(&entry)?;
+            Ok(entry)
+        })();
+        match result {
+            Ok(entry) => tool_ok(serde_json::json!({
+                "recorded": true,
+                "against": entry.hit_symbol,
+                "kind": entry.kind,
+            })),
+            Err(e) => tool_err(format!("ack failed (fail-open): {e}")),
+        }
+    }
+
+    /// Run the objective adoption channel (M1 infer): classify pending
+    /// advisories from the next commit. Issue #14: MCP-only hosts could not
+    /// trigger it before.
+    #[tool(
+        description = "Infer adoption outcomes for pending advisories from the next commit (objective channel). Run post-commit."
+    )]
+    fn infer(&self, Parameters(p): Parameters<InferParams>) -> String {
+        let repo = resolve_repo(p.repo);
+        let cfg = load_config(&repo);
+        let result = (|| -> anyhow::Result<_> {
+            let (store, _shared) = ward_core::store::Store::open_for_query(&repo)?;
+            ward_core::infer::infer_pending(&repo, &store, &cfg)
+        })();
+        match result {
+            Ok(r) => tool_ok(r),
+            Err(e) => tool_err(format!("infer failed (fail-open): {e}")),
         }
     }
 

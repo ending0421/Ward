@@ -138,7 +138,7 @@ artifact_glob = "target/*/release/lib*.so"
 }
 ```
 
-The daemon exposes 10 tools over stdio MCP, using the official Rust MCP
+The daemon exposes 12 tools over stdio MCP, using the official Rust MCP
 SDK ([rmcp](https://crates.io/crates/rmcp)):
 
 | Tool | Purpose |
@@ -153,6 +153,8 @@ SDK ([rmcp](https://crates.io/crates/rmcp)):
 | `compat_check` | Public-API compatibility between two revisions |
 | `context_card` | Read a symbol's context card: fingerprint layers, mentions, change history |
 | `clusters` | Duplicate clusters at a similarity threshold (M6) |
+| `ack` | Record an ack-registry entry (not-reusable / converges) — MCP parity with `ward ack` |
+| `infer` | Run the objective adoption channel over pending advisories (M1) |
 
 All tools are fail-open and report structured results — a failure is an
 answer, never a broken session.
@@ -184,7 +186,7 @@ basic/std param types — issue #5) degrade to shape-only matches: they are
 returned for humans but flagged `low_confidence` and never graded Strong,
 so automated gates can ignore them by construction.
 
-## Consumer boundary contract (v0.7.0)
+## Consumer boundary contract (v0.8.0)
 
 Gates consume `spot` as JSON + exit codes — silence must never mean absence:
 
@@ -197,9 +199,17 @@ Gates consume `spot` as JSON + exit codes — silence must never mean absence:
 | `low_confidence: true` | low-specificity signature — never Strong |
 | ack registry | `ward ack --against <hit>`; hits acked once stay suppressed (`--show-acked`) |
 | `--consumes <symbol>` | consolidation edits demote to `kind: consumed` |
+| `worktree` / `worktree_branch` | hit was collected from that LINKED WORKTREE (unmerged source); `match.path` is relative to it |
+| `worktree_symbols` | how many indexed symbols carry worktree provenance (0 = none collected) |
 
 `ward setup-hooks` chains (never clobbers) an existing post-commit
 (`post-commit.pre-ward`, restore on `--remove`).
+
+Worktree provenance is opt-in for manual runs (`ward index
+--include-worktrees`, or `[index] include_worktrees = true`): collection only
+happens when asked, and a later index without the flag purges it. The
+PostToolUse hook always passes the flag, so the silent path collects
+worktree-local duplicates without any human decision.
 
 ## More commands
 
@@ -278,7 +288,7 @@ crates/
                # catch-run/verify/form-check/compat-check/infer/label/calibrate/
                # snapshot/stats/daemon/service/doctor/report/issue/setup-hooks/
                # intent-check/card/clusters/action)
-  ward-mcp/    # MCP daemon (stdio, 10 tools, official Rust SDK)
+  ward-mcp/    # MCP daemon (stdio, 12 tools, official Rust SDK)
   ward-bench/  # F11 scale benchmark: synthetic-repo gen + timed engine runs
 hooks/         # Claude Code PreToolUse/PostToolUse scripts
 examples/      # example spec + Claude Code settings
