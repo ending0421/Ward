@@ -46,6 +46,16 @@ pub struct SpotParams {
     /// Monorepo scope filter (spec §2.6): only return hits from this
     /// package/module.
     pub scope: Option<String>,
+    /// Fast path (issue #8): low-specificity signatures answer without
+    /// touching the index.
+    pub quick: Option<bool>,
+    /// Keep matches suppressed by the ack registry (issue #9).
+    pub show_acked: Option<bool>,
+    /// "This edit consumes/consolidates the named symbol" (issue #10).
+    pub consumes: Option<String>,
+    /// Freshness floors (issue #7): exceeded ⇒ stale_severe in the result.
+    pub max_staleness_commits: Option<u64>,
+    pub max_staleness_days: Option<u64>,
     /// Repository root; defaults to the daemon's working directory.
     pub repo: Option<String>,
     /// Number of matches to return.
@@ -146,23 +156,27 @@ impl WardMcp {
         if let Some(k) = p.top_k {
             cfg.top_k = k;
         }
-        let result = (|| -> anyhow::Result<_> {
-            let store = Store::open(&Store::default_path(&repo))?;
-            let lang = p
-                .language
-                .as_deref()
-                .and_then(ward_core::lang::Language::from_name);
-            ward_core::search::spot(
-                &repo,
-                &store,
-                &cfg,
-                &p.intent,
-                p.proposed_signature.as_deref(),
-                p.proposed_body.as_deref(),
-                lang,
-                p.scope.as_deref(),
-            )
-        })();
+        let lang = p
+            .language
+            .as_deref()
+            .and_then(ward_core::lang::Language::from_name);
+        let options = ward_core::search::SpotOptions {
+            scope: p.scope.clone(),
+            quick: p.quick.unwrap_or(false),
+            show_acked: p.show_acked.unwrap_or(false),
+            consumes: p.consumes.clone(),
+            max_staleness_commits: p.max_staleness_commits,
+            max_staleness_days: p.max_staleness_days,
+        };
+        let result = ward_core::search::spot(
+            &repo,
+            &cfg,
+            &p.intent,
+            p.proposed_signature.as_deref(),
+            p.proposed_body.as_deref(),
+            lang,
+            &options,
+        );
         match result {
             Ok(r) => tool_ok(r),
             Err(e) => tool_err(format!("spot failed (fail-open): {e}")),

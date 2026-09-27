@@ -106,13 +106,15 @@ pub fn spot_new_symbols_scoped(
         let intent = format!("新增/变更符号 {}（{}）", e.symbol.name, path);
         let result = search::spot(
             repo,
-            store,
             config,
             &intent,
             Some(&sig),
             None,
             Some(lang),
-            scope,
+            &search::SpotOptions {
+                scope: scope.map(String::from),
+                ..Default::default()
+            },
         )?;
         advisories.push(result);
     }

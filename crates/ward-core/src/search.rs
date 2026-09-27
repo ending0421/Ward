@@ -20,7 +20,7 @@ use crate::config::WardConfig;
 use crate::embedding::EmbeddingProvider;
 use crate::fingerprint;
 use crate::lang::Language;
-use crate::store::{Advisory, Store, Symbol};
+use crate::store::{Advisory, Symbol};
 
 /// One advisory match.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -44,6 +44,24 @@ pub struct SpotMatch {
     pub note: String,
 }
 
+/// Query options for the Spot pipeline (the v0.7.0 consumer contract).
+#[derive(Debug, Clone, Default)]
+pub struct SpotOptions {
+    /// Monorepo scope filter (spec §2.6).
+    pub scope: Option<String>,
+    /// Fast path (issue #8): low-specificity signatures answer without
+    /// touching the index (`quick: true` in the result).
+    pub quick: bool,
+    /// Keep matches suppressed by the ack registry (issue #9).
+    pub show_acked: bool,
+    /// "This edit consumes/consolidates the named symbol" — matching hits
+    /// demote to informational and record a convergence event (issue #10).
+    pub consumes: Option<String>,
+    /// Freshness floors (issue #7): exceeded ⇒ `stale_severe: true`.
+    pub max_staleness_commits: Option<u64>,
+    pub max_staleness_days: Option<u64>,
+}
+
 /// The advisory payload returned by `spot`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SpotResult {
@@ -51,6 +69,30 @@ pub struct SpotResult {
     pub stale: bool,
     pub matches: Vec<SpotMatch>,
     pub advisory_id: String,
+    /// Absolute root that `match.path` is relative to (issue #6).
+    #[serde(default)]
+    pub repo_root: String,
+    /// `missing` | `empty` | `fresh` | `stale` | `unchecked`(quick path).
+    /// Machines gate on this; silence must never mean absence (issue #6).
+    #[serde(default)]
+    pub index_state: String,
+    /// Symbols in the index backing this advisory.
+    #[serde(default)]
+    pub symbol_count: u64,
+    /// The staleness floor was exceeded (issue #7): consumers should
+    /// refuse rather than trust this answer.
+    #[serde(default)]
+    pub stale_severe: bool,
+    /// Commits between the index and HEAD (None when unmeasurable).
+    #[serde(default)]
+    pub stale_commits: Option<u64>,
+    /// Answered via the `--quick` fast path without touching the index.
+    #[serde(default)]
+    pub quick: bool,
+    /// Absolute root of the checkout whose index was used, when a linked
+    /// worktree shared the main checkout's index (issue #6).
+    #[serde(default)]
+    pub index_shared_from: Option<String>,
     /// The QUERY signature's specificity (issue #5): fraction of
     /// domain-typed params. Legacy payloads deserialize to 0.0.
     #[serde(default)]
@@ -295,23 +337,81 @@ pub fn parse_query_language(
 }
 
 /// Run the full Spot pipeline and record the advisory.
-//
-// The argument list is the query surface (intent/signature/body/language/
-// scope) plus its context (repo/store/config) — a struct would only move
-// the verbosity around.
+///
+/// The store is opened query-side: never auto-created (issue #6), linked
+/// worktrees transparently share the main checkout's index. The v0.7.0
+/// result contract exposes index state, staleness severity and the
+/// absolute root that match paths are relative to.
 #[allow(clippy::too_many_arguments)]
 pub fn spot(
     repo: &Path,
-    store: &Store,
     config: &WardConfig,
     intent: &str,
     proposed_signature: Option<&str>,
     proposed_body: Option<&str>,
     language: Option<Language>,
-    scope: Option<&str>,
+    options: &SpotOptions,
 ) -> Result<SpotResult> {
+    let repo_root = repo
+        .canonicalize()
+        .unwrap_or_else(|_| repo.to_path_buf())
+        .to_string_lossy()
+        .into_owned();
+    let scope = options.scope.as_deref();
+    let missing = |state: &str| SpotResult {
+        as_of: None,
+        stale: true,
+        matches: Vec::new(),
+        advisory_id: String::new(),
+        repo_root: repo_root.clone(),
+        index_state: state.into(),
+        symbol_count: 0,
+        stale_severe: false,
+        stale_commits: None,
+        quick: false,
+        index_shared_from: None,
+        query_specificity: 0.0,
+        low_confidence: false,
+        query: Some(intent.to_string()),
+    };
+
+    // Issue #8 fast path: low specificity is decidable from the signature
+    // alone — answer before touching any index.
+    if options.quick {
+        if let Some((lang, _)) =
+            proposed_signature.and_then(|sig| parse_query_language(sig, language))
+        {
+            if let Some(sig) = proposed_signature {
+                let spec = crate::specificity::signature_specificity(lang, sig).unwrap_or(0.0);
+                if spec < config.thresholds.specificity_floor {
+                    return Ok(SpotResult {
+                        quick: true,
+                        index_state: "unchecked".into(),
+                        query_specificity: spec,
+                        low_confidence: true,
+                        ..missing("unchecked")
+                    });
+                }
+            }
+        }
+    }
+
+    let (store, shared_from) = match crate::store::Store::open_for_query(repo) {
+        Ok(pair) => pair,
+        Err(_) => return Ok(missing("missing")),
+    };
     let symbols = store.all_symbols()?;
+    if symbols.is_empty() {
+        return Ok(missing("empty"));
+    }
     let bm25 = store.bm25()?;
+    // Issue #9: registry-acked hits are suppressed by default — decisions
+    // recorded once must not re-litigate at every new edit site.
+    let acked: HashSet<String> = if options.show_acked {
+        HashSet::new()
+    } else {
+        store.acked_hits()?
+    };
 
     let mut query = tokenize(intent);
     if let Some(sig) = proposed_signature {
@@ -360,6 +460,7 @@ pub fn spot(
             .iter()
             .filter(|s| &s.struct_hash == qs)
             .filter(|s| in_scope(&s.module))
+            .filter(|s| !acked.contains(&s.name))
             .filter(|s| !config.is_suppressed(&s.file_path))
         {
             if matches.len() >= config.top_k {
@@ -407,7 +508,10 @@ pub fn spot(
                     break;
                 }
                 let sym = &symbols[idx];
-                if !in_scope(&sym.module) || config.is_suppressed(&sym.file_path) {
+                if acked.contains(&sym.name)
+                    || !in_scope(&sym.module)
+                    || config.is_suppressed(&sym.file_path)
+                {
                     continue;
                 }
                 if !claimed.insert((sym.file_path.clone(), sym.name.clone())) {
@@ -437,7 +541,10 @@ pub fn spot(
             let candidates = bm25.recall(&query, 50);
             for (idx, bm25_score) in candidates {
                 let sym = &symbols[idx];
-                if !in_scope(&sym.module) || config.is_suppressed(&sym.file_path) {
+                if acked.contains(&sym.name)
+                    || !in_scope(&sym.module)
+                    || config.is_suppressed(&sym.file_path)
+                {
                     continue;
                 }
                 if !claimed.insert((sym.file_path.clone(), sym.name.clone())) {
@@ -484,6 +591,14 @@ pub fn spot(
             // blocking: returned, but capped at Weak (issue #5).
             g = Grade::Weak;
             m.note = "低特异度签名（基础类型为主）：仅弱提示，自动化门禁应忽略".into();
+        }
+        // Issue #10: an edit that declares it consumes the hit is the
+        // consolidation the gate exists to force — informational, not a
+        // block.
+        if options.consumes.as_deref().is_some_and(|c| c == m.symbol) {
+            g = Grade::Weak;
+            m.kind = "consumed".into();
+            m.note = "本次编辑消费/整合该符号（--consumes）：信息性提示".into();
         }
         if g != Grade::Filtered {
             m.specificity = symbol_specificity(repo, &m);
@@ -540,9 +655,48 @@ pub fn spot(
 
     let fresh = crate::fresh::check(
         repo,
-        store,
+        &store,
         &matches.iter().map(|m| m.path.clone()).collect::<Vec<_>>(),
     )?;
+
+    // Issue #7: freshness severity — commits behind HEAD, and (when a
+    // floor is set) whether that floor is exceeded.
+    let stale_commits = if fresh.stale {
+        fresh
+            .as_of
+            .as_deref()
+            .and_then(|sha| crate::git::commits_behind(repo, sha))
+    } else {
+        Some(0)
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or_default();
+    let stale_days = fresh.as_of.as_deref().and_then(|sha| {
+        crate::git::commit_timestamp(repo, sha).map(|ts| (now - ts).max(0) / 86400)
+    });
+    let stale_severe = options
+        .max_staleness_commits
+        .is_some_and(|n| stale_commits.is_none_or(|c| c > n))
+        || options
+            .max_staleness_days
+            .is_some_and(|d| stale_days.is_none_or(|days| days > d as i64));
+    if stale_severe {
+        // Severity is a machine field; the CLI exit code is the gate
+        // contract (3 = cannot answer honestly).
+        for m in &mut matches {
+            m.note.push_str("；索引严重滞后，本结果不可采信（#7）");
+        }
+    } else if fresh.stale {
+        // Coordinates in a stale advisory are historical: flag hits whose
+        // files no longer exist at HEAD.
+        for m in &mut matches {
+            if !m.path.is_empty() && !crate::git::exists_at_head(repo, &m.path) {
+                m.note.push_str("；该命中在 HEAD 已删除（坐标历史）");
+            }
+        }
+    }
 
     let query_hash = {
         let mut h = blake3::Hasher::new();
@@ -562,10 +716,34 @@ pub fn spot(
         stale: fresh.stale,
         matches,
         advisory_id: advisory_id.clone(),
+        repo_root: repo_root.clone(),
+        index_state: if fresh.stale { "stale" } else { "fresh" }.into(),
+        symbol_count: symbols.len() as u64,
+        stale_severe,
+        stale_commits,
+        quick: false,
+        index_shared_from: shared_from
+            .as_ref()
+            .map(|p| p.to_string_lossy().into_owned()),
         query_specificity,
         low_confidence,
         query: Some(intent.to_string()),
     };
+    // Issue #10: record convergence events (consumed hits) in the registry.
+    if let Some(consumed) = options.consumes.as_deref() {
+        if result.matches.iter().any(|m| m.symbol == consumed) && !acked.contains(consumed) {
+            store.record_ack(&crate::store::Ack {
+                id: None,
+                new_symbol: String::new(),
+                hit_symbol: consumed.to_string(),
+                hit_path: None,
+                reason: "--consumes".into(),
+                advisory_id: Some(advisory_id.clone()),
+                kind: "converges".into(),
+                ts: now,
+            })?;
+        }
+    }
     // Store the FULL payload — the inference channel and the golden-set
     // labeling both re-read it (query text, per-match similarity).
     store.record_advisory(&Advisory {
@@ -595,6 +773,13 @@ pub fn parse_spot_payload(json: &str) -> Option<SpotResult> {
         stale: false,
         matches,
         advisory_id: String::new(),
+        repo_root: String::new(),
+        index_state: "legacy".into(),
+        symbol_count: 0,
+        stale_severe: false,
+        stale_commits: None,
+        quick: false,
+        index_shared_from: None,
         query_specificity: 0.0,
         low_confidence: false,
         query: None,

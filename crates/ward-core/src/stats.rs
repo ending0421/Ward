@@ -51,6 +51,14 @@ pub struct Series {
     pub points: Vec<SeriesPoint>,
 }
 
+/// Index freshness line (issue #7): the sha the index was built from and
+/// how many commits behind HEAD it is.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FreshnessLine {
+    pub as_of: String,
+    pub commits_behind: u64,
+}
+
 /// The full governance report (JSON shape stable enough for dashboards).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GovReport {
@@ -62,6 +70,11 @@ pub struct GovReport {
     pub series: Vec<Series>,
     /// Inter-annotator agreement over the golden set (spec §8 标注腐烂护栏).
     pub agreement: crate::label::AgreementReport,
+    /// Index freshness (issue #7) — the headline consumers must see.
+    pub freshness: Option<FreshnessLine>,
+    /// Ack-registry size (issue #9) — accumulated machine-recorded
+    /// escape-hatch decisions.
+    pub acks: i64,
 }
 
 fn rate(ok: i64, total: i64) -> Option<f64> {
@@ -121,6 +134,13 @@ pub fn stats(repo: &Path, store: &Store, config: &WardConfig) -> Result<GovRepor
 
     let pass_rate = rate(pass, runs);
     let decay_hint = store.constraint_decay_hint()?;
+    let freshness = store.last_indexed_sha()?.and_then(|sha| {
+        crate::git::commits_behind(repo, &sha).map(|c| FreshnessLine {
+            as_of: sha,
+            commits_behind: c,
+        })
+    });
+    let acks = store.ack_count()?;
 
     let series = vec![
         Series {
@@ -184,6 +204,8 @@ pub fn stats(repo: &Path, store: &Store, config: &WardConfig) -> Result<GovRepor
         },
         series,
         agreement: crate::label::annotator_agreement(store)?,
+        freshness,
+        acks,
     })
 }
 
@@ -201,12 +223,24 @@ pub fn render_table(report: &GovReport) -> String {
         .unwrap_or_else(|| "-".into());
     let mut out = format!(
         "Ward 治理报表 {}\n\
+         索引新鲜度: {}（滞后 {} commits）| ack 登记: {} 条\n\
          采纳（推断通道）: {}/{} = {:.0}% | 拒绝: {}\n\
          采纳（自报通道）: {}/{} = {:.0}% | 背离: {}\n\
          符号: {} | 重复簇: {} | 黄金集标注: {}\n\
          断言执行: {} | 通过率: {} | 衰减提示: {}\n\
          标注一致性: 双标 match {} 个 | Fleiss κ = {} | {}",
         report.repo,
+        report
+            .freshness
+            .as_ref()
+            .map(|f| f.as_of[..f.as_of.len().min(8)].to_string())
+            .unwrap_or_else(|| "-".into()),
+        report
+            .freshness
+            .as_ref()
+            .map(|f| f.commits_behind)
+            .unwrap_or(0),
+        report.acks,
         a.inferred_accepted,
         a.inferred_total,
         rate(a.inferred_accepted, a.inferred_total).unwrap_or(0.0) * 100.0,

@@ -211,13 +211,12 @@ pub fn run_bench(repo: &Path, queries: usize) -> Result<BenchReport> {
         let t = Instant::now();
         let _ = ward_core::search::spot(
             repo,
-            &store,
             &cfg,
             "benchmark probe",
             Some(&sig),
             None,
             lang,
-            None,
+            &ward_core::search::SpotOptions::default(),
         )?;
         lat_ms.push(t.elapsed().as_secs_f64() * 1000.0);
     }

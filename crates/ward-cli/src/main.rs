@@ -99,6 +99,23 @@ enum Cmd {
         /// package/module; the hook flow derives it automatically.
         #[arg(long)]
         scope: Option<String>,
+        /// Fast path (issue #8): low-specificity signatures answer without
+        /// touching the index (result carries quick:true).
+        #[arg(long)]
+        quick: bool,
+        /// Keep matches suppressed by the ack registry (issue #9).
+        #[arg(long)]
+        show_acked: bool,
+        /// "This edit consumes/consolidates the named symbol" — matching
+        /// hits demote to informational and record a convergence event.
+        #[arg(long)]
+        consumes: Option<String>,
+        /// Freshness floors (issue #7): exceeded ⇒ exit 3 (cannot answer
+        /// honestly). Set either or both.
+        #[arg(long)]
+        max_staleness_commits: Option<u64>,
+        #[arg(long)]
+        max_staleness_days: Option<u64>,
         #[arg(default_value = ".", long)]
         repo: PathBuf,
         #[arg(long)]
@@ -308,6 +325,31 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// Record an ack-registry entry (issue #9): "the hit is not reusable
+    /// from this site" (ack) or "this edit consolidates the hit"
+    /// (converges). Gates consult the registry to stop re-litigating.
+    Ack {
+        /// The new symbol being written (empty when unknown).
+        #[arg(long, default_value = "")]
+        new: String,
+        /// The hit symbol the decision is against.
+        #[arg(long)]
+        against: String,
+        /// The hit's path, when known.
+        #[arg(long)]
+        path: Option<String>,
+        /// One-line rationale (audited in ward stats).
+        #[arg(long, default_value = "")]
+        reason: String,
+        /// ack | converges
+        #[arg(long, default_value = "ack", value_parser = ["ack", "converges"])]
+        kind: String,
+        /// The advisory this decision came from.
+        #[arg(long)]
+        advisory: Option<String>,
+        #[arg(default_value = ".", long)]
+        repo: PathBuf,
+    },
     /// Record the agent's self-reported action for an advisory (M1 feedback)
     Action {
         advisory: String,
@@ -380,11 +422,15 @@ fn main() -> Result<()> {
             body_file,
             language,
             scope,
+            quick,
+            show_acked,
+            consumes,
+            max_staleness_commits,
+            max_staleness_days,
             repo,
             json,
         } => {
             let cfg = load_config(&repo);
-            let store = open_store(&repo)?;
             let lang = match language
                 .as_deref()
                 .map(ward_core::lang::Language::from_name)
@@ -409,16 +455,27 @@ fn main() -> Result<()> {
                 (Some(b), None) => Some(b.to_string()),
                 (None, None) => None,
             };
+            let options = search::SpotOptions {
+                scope,
+                quick,
+                show_acked,
+                consumes,
+                max_staleness_commits,
+                max_staleness_days,
+            };
             let result = search::spot(
                 &repo,
-                &store,
                 &cfg,
                 &intent,
                 signature.as_deref(),
                 body_arg.as_deref(),
                 lang,
-                scope.as_deref(),
+                &options,
             )?;
+            // Issue #7 contract: exit 3 = cannot answer honestly (missing/
+            // empty index, or a staleness floor exceeded).
+            let cannot_answer =
+                result.stale_severe || matches!(result.index_state.as_str(), "missing" | "empty");
             if json {
                 print_json(&result)?;
             } else {
@@ -438,11 +495,47 @@ fn main() -> Result<()> {
                 if result.stale {
                     println!("  warning: index is stale; treat matches as weak evidence");
                 }
+                match result.index_state.as_str() {
+                    "missing" => println!(
+                        "  ERROR: 该仓库没有索引（ward index --repo .）——此结果不构成\"无重复\"证据（#6）"
+                    ),
+                    "empty" => {
+                        println!("  ERROR: 索引为空（0 符号）——此结果不构成\"无重复\"证据（#6）")
+                    }
+                    _ => {}
+                }
+                if result.stale_severe {
+                    println!(
+                        "  ERROR: 索引严重滞后（{} commits behind）——请刷新后再信任（#7）",
+                        result.stale_commits.unwrap_or_default()
+                    );
+                }
+            }
+            if cannot_answer {
+                std::process::exit(3);
             }
         }
         Cmd::SpotFile { path, repo, json } => {
             let cfg = load_config(&repo);
-            let store = open_store(&repo)?;
+            let (store, _shared) = match ward_core::store::Store::open_for_query(&repo) {
+                Ok(pair) => pair,
+                Err(_) => {
+                    // Fail-open: an unindexed repo cannot answer spot-file —
+                    // report empty instead of creating an index (issue #6).
+                    let report = ward_core::spotfile::FileSpotReport {
+                        path: path.clone(),
+                        changed_symbols: vec![],
+                        checked: 0,
+                        advisories: vec![],
+                    };
+                    if json {
+                        print_json(&report)?;
+                    } else {
+                        println!("spot-file {path}: (repo not indexed — skipped, #6)");
+                    }
+                    return Ok(());
+                }
+            };
             // The hook flow is scope-aware: hits outside the written file's
             // package/module are excluded (spec §2.6 monorepo hygiene).
             let scope = ward_core::index::module_of_path(&repo, &path);
@@ -741,6 +834,36 @@ fn main() -> Result<()> {
                 println!("labeled {advisory_id}#{match_index} = {verdict} ({annotator})");
             }
         },
+        Cmd::Ack {
+            new,
+            against,
+            path,
+            reason,
+            kind,
+            advisory,
+            repo,
+        } => {
+            let (store, _shared) = match ward_core::store::Store::open_for_query(&repo) {
+                Ok(pair) => pair,
+                Err(_) => {
+                    anyhow::bail!("该仓库没有索引；先 ward index --repo .（ack 登记需要索引存在）")
+                }
+            };
+            store.record_ack(&ward_core::store::Ack {
+                id: None,
+                new_symbol: new,
+                hit_symbol: against.clone(),
+                hit_path: path,
+                reason,
+                advisory_id: advisory,
+                kind,
+                ts: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or_default(),
+            })?;
+            println!("acked {against}（ward spot 将不再返回该命中；--show-acked 可见）");
+        }
         Cmd::Calibrate { repo, json } => {
             let store = open_store(&repo)?;
             let report = ward_core::calibrate::calibrate(&store)?;
@@ -1092,27 +1215,44 @@ fn main() -> Result<()> {
         },
         Cmd::SetupHooks { repo, remove } => {
             let hook_path = repo.join(".git/hooks/post-commit");
+            let pre_ward = repo.join(".git/hooks/post-commit.pre-ward");
             if remove {
-                match std::fs::remove_file(&hook_path) {
-                    Ok(()) => println!("removed {}", hook_path.display()),
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                        println!("no hook at {}", hook_path.display());
+                // Issue #11: restore the chained original instead of
+                // deleting outright.
+                if hook_path.exists() && pre_ward.exists() {
+                    std::fs::rename(&pre_ward, &hook_path)?;
+                    println!("removed ward chain; restored {}", hook_path.display());
+                } else {
+                    match std::fs::remove_file(&hook_path) {
+                        Ok(()) => println!("removed {}", hook_path.display()),
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                            println!("no hook at {}", hook_path.display());
+                        }
+                        Err(e) => anyhow::bail!("removing hook: {e}"),
                     }
-                    Err(e) => anyhow::bail!("removing hook: {e}"),
                 }
-            } else {
-                if !repo.join(".git").is_dir() {
-                    anyhow::bail!("{} is not a git repository", repo.display());
-                }
-                let script = "#!/bin/sh\n# Ward post-commit: infer adoption outcomes (fail-open, never blocks).\nexec ward infer --repo \"$(git rev-parse --show-toplevel)\"\n";
-                std::fs::write(&hook_path, script)?;
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    std::fs::set_permissions(&hook_path, std::fs::Permissions::from_mode(0o755))?;
-                }
-                println!("installed {}", hook_path.display());
+                return Ok(());
             }
+            if !repo.join(".git").is_dir() && !repo.join(".git").is_file() {
+                anyhow::bail!("{} is not a git repository", repo.display());
+            }
+            // Issue #11: never clobber an existing hook — backup-and-chain
+            // (the ecosystem convention, .pre-ward suffix): ward's script
+            // runs the original first, both fail-open.
+            let existing = std::fs::read_to_string(&hook_path).unwrap_or_default();
+            let is_ward = existing.contains("WARD_HOOK_CHAIN");
+            if !existing.trim().is_empty() && !is_ward {
+                std::fs::rename(&hook_path, &pre_ward)?;
+                println!("existing hook preserved at {}", pre_ward.display());
+            }
+            let script = "#!/bin/sh\n# WARD_HOOK_CHAIN: post-commit chain installed by `ward setup-hooks`.\n# Both steps fail-open — Ward must never break git (P3).\nHOOK_DIR=$(dirname \"$0\")\nif [ -x \"$HOOK_DIR/post-commit.pre-ward\" ]; then \"$HOOK_DIR/post-commit.pre-ward\" \"$@\" || true; fi\ncommand -v ward >/dev/null 2>&1 && ward infer --repo \"$(git rev-parse --show-toplevel)\" >> \"$HOME/.ward/post-commit.log\" 2>&1 || true\n";
+            std::fs::write(&hook_path, script)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&hook_path, std::fs::Permissions::from_mode(0o755))?;
+            }
+            println!("installed {}", hook_path.display());
         }
         Cmd::IntentCheck {
             requirement,

@@ -1,7 +1,7 @@
 //! Thin git plumbing — Ward shells out to the real git (law P1: git is the
 //! only source of truth, so Ward *reads* it rather than reimplementing it).
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, Result};
@@ -58,6 +58,85 @@ pub fn diff_names(repo: &Path, base: &str, head: &str) -> Result<Vec<String>> {
 }
 
 /// blake3 of a file's content — the per-file freshness key (spec §5).
+/// True when `repo` is a linked git worktree (or a separated-git-dir
+/// checkout): its `.git` is a FILE containing `gitdir: …`.
+pub fn is_linked_worktree(repo: &Path) -> bool {
+    let dot_git = repo.join(".git");
+    let Ok(meta) = std::fs::metadata(&dot_git) else {
+        return false;
+    };
+    if !meta.is_file() {
+        return false;
+    }
+    std::fs::read_to_string(&dot_git)
+        .map(|c| c.trim_start().starts_with("gitdir:"))
+        .unwrap_or(false)
+}
+
+/// The main checkout's worktree path for a linked worktree (the first
+/// entry of `git worktree list --porcelain`). `None` for a normal repo.
+pub fn main_worktree(repo: &Path) -> Option<PathBuf> {
+    let out = std::process::Command::new("git")
+        .args(["worktree", "list", "--porcelain"])
+        .current_dir(repo)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    for line in text.lines() {
+        if let Some(path) = line.strip_prefix("worktree ") {
+            let p = PathBuf::from(path);
+            if p != repo {
+                return Some(p);
+            }
+        }
+    }
+    None
+}
+
+/// Commits between `sha` (exclusive) and HEAD: how far behind the index
+/// is. `None` when `sha` is unresolvable (e.g. shallow/detached noise).
+pub fn commits_behind(repo: &Path, sha: &str) -> Option<u64> {
+    let out = std::process::Command::new("git")
+        .args(["rev-list", "--count"])
+        .arg(format!("{sha}..HEAD"))
+        .current_dir(repo)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&out.stdout).trim().parse().ok()
+}
+
+/// Timestamp of `sha` (unix seconds) — for age-based staleness floors.
+pub fn commit_timestamp(repo: &Path, sha: &str) -> Option<i64> {
+    let out = std::process::Command::new("git")
+        .args(["show", "-s", "--format=%ct"])
+        .arg(sha)
+        .current_dir(repo)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&out.stdout).trim().parse().ok()
+}
+
+/// True when `path` exists in the HEAD commit (false = deleted since
+/// `as_of` — coordinates in stale advisories are historical).
+pub fn exists_at_head(repo: &Path, path: &str) -> bool {
+    std::process::Command::new("git")
+        .args(["cat-file", "-e"])
+        .arg(format!("HEAD:{path}"))
+        .current_dir(repo)
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(true) // fail-open: unknown ⇒ don't claim deletion
+}
+
 pub fn file_hash(path: &Path) -> Option<String> {
     let bytes = std::fs::read(path).ok()?;
     let mut h = blake3::Hasher::new();

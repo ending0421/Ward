@@ -10,7 +10,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 /// Current schema version. Bump on any schema change; mismatches trigger a
 /// full rebuild instead of a migration (rebuild is cheap and always safe).
-pub const SCHEMA_VERSION: i64 = 7;
+pub const SCHEMA_VERSION: i64 = 8;
 
 /// One indexed symbol (function / struct / enum / trait / method, …).
 #[derive(Debug, Clone, PartialEq)]
@@ -66,6 +66,21 @@ pub struct Label {
     pub kind: Option<String>,
     pub similarity: Option<f64>,
     pub verdict: String,
+    pub ts: i64,
+}
+
+/// One ack-registry entry (issue #9): a machine-recorded escape-hatch
+/// decision — `ack` = "the hit is not reusable from this site",
+/// `converges` = "this edit consolidates the hit".
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Ack {
+    pub id: Option<i64>,
+    pub new_symbol: String,
+    pub hit_symbol: String,
+    pub hit_path: Option<String>,
+    pub reason: String,
+    pub advisory_id: Option<String>,
+    pub kind: String,
     pub ts: i64,
 }
 
@@ -239,6 +254,21 @@ fn create_schema(conn: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_labels_lang ON labels(language);
         CREATE INDEX IF NOT EXISTS idx_labels_match ON labels(advisory_id, match_index);
 
+        -- Ack registry (issue #9): machine-recorded "this hit is not
+        -- reusable" / "this edit consolidates the hit" decisions, written
+        -- by gates/hooks, consulted by spot to stop re-litigating.
+        CREATE TABLE IF NOT EXISTS acks (
+            id          INTEGER PRIMARY KEY,
+            new_symbol  TEXT NOT NULL DEFAULT '',
+            hit_symbol  TEXT NOT NULL,
+            hit_path    TEXT,
+            reason      TEXT NOT NULL DEFAULT '',
+            advisory_id TEXT,
+            kind        TEXT NOT NULL DEFAULT 'ack',  -- ack | converges
+            ts          INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_acks_hit ON acks(hit_symbol);
+
         -- Trend snapshots (spec §9): one row per day, idempotent.
         CREATE TABLE IF NOT EXISTS snapshots (
             ts               INTEGER PRIMARY KEY,   -- day key (unix day)
@@ -316,7 +346,7 @@ impl Store {
     /// rebuild therefore preserves it: derived tables are wiped, governance
     /// tables are carried across (F1 rebuild loses speed, never truth).
     fn reset(conn: &Connection) -> Result<()> {
-        const GOVERNANCE: &[&str] = &["advisories", "labels", "snapshots", "contract_runs"];
+        const GOVERNANCE: &[&str] = &["advisories", "labels", "snapshots", "contract_runs", "acks"];
         conn.execute_batch("BEGIN;")?;
         for table in GOVERNANCE {
             conn.execute_batch(&format!(
@@ -545,6 +575,92 @@ impl Store {
             *cache = Some(std::rc::Rc::new(crate::search::Bm25::build(&symbols)));
         }
         Ok(cache.as_ref().expect("built above").clone())
+    }
+
+    /// Open WITHOUT creating (issue #6): spot must distinguish "not
+    /// indexed" from "indexed, no matches" — auto-creating an empty index
+    /// certifies absence with nothing to match against.
+    pub fn open_existing(path: &Path) -> Result<Store> {
+        if !path.exists() {
+            anyhow::bail!(
+                "index does not exist at {} (run `ward index`)",
+                path.display()
+            );
+        }
+        Store::open(path)
+    }
+
+    /// Query-side open (issue #6): prefer the repo's own index; a linked
+    /// worktree without one transparently shares the MAIN checkout's index
+    /// (its committed content is byte-identical at the same commit; the
+    /// per-file freshness hashes still compare the worktree's files).
+    /// Returns the store plus the shared checkout root when sharing.
+    pub fn open_for_query(repo: &Path) -> Result<(Store, Option<PathBuf>)> {
+        let own = Store::default_path(repo);
+        if own.exists() {
+            return Ok((Store::open(&own)?, None));
+        }
+        if crate::git::is_linked_worktree(repo) {
+            if let Some(main) = crate::git::main_worktree(repo) {
+                let main_db = Store::default_path(&main);
+                if main_db.exists() {
+                    return Ok((Store::open(&main_db)?, Some(main)));
+                }
+            }
+        }
+        anyhow::bail!("no index for {} (run `ward index`)", repo.display())
+    }
+
+    pub fn record_ack(&self, a: &Ack) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO acks (new_symbol, hit_symbol, hit_path, reason, advisory_id, kind, ts)
+             VALUES (?1,?2,?3,?4,?5,?6,?7)",
+            params![
+                a.new_symbol,
+                a.hit_symbol,
+                a.hit_path,
+                a.reason,
+                a.advisory_id,
+                a.kind,
+                a.ts,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// All ack entries keyed by hit symbol (spot's suppression filter).
+    pub fn acked_hits(&self) -> Result<std::collections::HashSet<String>> {
+        let mut stmt = self.conn.prepare("SELECT DISTINCT hit_symbol FROM acks")?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        rows.collect::<rusqlite::Result<_>>().map_err(Into::into)
+    }
+
+    /// Full ack registry for stats auditing (existence-bound freshness:
+    /// entries whose hit symbol no longer exists are surfaced as stale).
+    pub fn all_acks(&self) -> Result<Vec<Ack>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, new_symbol, hit_symbol, hit_path, reason, advisory_id, kind, ts
+             FROM acks ORDER BY ts DESC",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(Ack {
+                id: r.get(0)?,
+                new_symbol: r.get(1)?,
+                hit_symbol: r.get(2)?,
+                hit_path: r.get(3)?,
+                reason: r.get(4)?,
+                advisory_id: r.get(5)?,
+                kind: r.get(6)?,
+                ts: r.get(7)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn ack_count(&self) -> Result<i64> {
+        Ok(self
+            .conn
+            .query_row("SELECT COUNT(*) FROM acks", [], |r| r.get(0))?)
     }
 
     pub fn record_label(&self, l: &Label) -> Result<()> {
