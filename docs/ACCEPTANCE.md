@@ -24,7 +24,7 @@
 | 测试总数 | 258（2 bench + 11 CLI smoke + 188 lib unit + 56 e2e + 1 doc） |
 | clippy | `-D warnings` 零告警 |
 | rustfmt | 干净 |
-| 覆盖率（workspace） | 85.7% 行（llvm-cov，门禁 ≥85%） |
+| 覆盖率（workspace） | 85.6% 行（CI llvm-cov 实测，门禁 ≥85%；本地 85.7%） |
 | 意义验证 | scripts/verify-meaningful.sh 11/11 |
 | 性能（F11 基线） | 10⁴：索引 7.5s / spot p99 25ms；10⁵：索引 11.9s / spot p99 73ms（near 全表扫描后余量 27%） |
 | 索引 schema | v9（symbols.module + worktree/worktree_branch provenance + acks 治理表；F1 重建保留治理数据，v8→v9 首次打开自动重建） |
