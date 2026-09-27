@@ -28,6 +28,18 @@ pub struct FileSpotReport {
     pub checked: usize,
     /// One advisory per checked symbol (in the same order).
     pub advisories: Vec<SpotResult>,
+    /// State of the index backing this report (issue #17):
+    /// `missing` (no index) / `empty` (0 symbols) / `fresh` / `stale`,
+    /// or `unchecked` when the report never consulted the index (not a
+    /// source file, unreadable, unparsable). Without it, a fail-open report
+    /// and "this write introduced nothing new" are byte-identical — the
+    /// same silence-as-absence hole #17 found in `spot`.
+    #[serde(default = "default_index_state")]
+    pub index_state: String,
+}
+
+fn default_index_state() -> String {
+    "unchecked".to_string()
 }
 
 impl FileSpotReport {
@@ -37,6 +49,7 @@ impl FileSpotReport {
             changed_symbols: Vec::new(),
             checked: 0,
             advisories: Vec::new(),
+            index_state: default_index_state(),
         }
     }
 }
@@ -79,9 +92,17 @@ pub fn spot_new_symbols_scoped(
     }
     let extracted = crate::index::extract_symbols(&tree, &source, lang.spec());
 
-    // Pre-write state: name → body_hash for this file only.
-    let old: HashMap<String, String> = store
-        .all_symbols()?
+    // Pre-write state: name → body_hash for this file only. The full symbol
+    // list doubles as the index-state probe (issue #17).
+    let all = store.all_symbols()?;
+    let index_state = if all.is_empty() {
+        "empty"
+    } else if crate::fresh::check(repo, store, &[])?.stale {
+        "stale"
+    } else {
+        "fresh"
+    };
+    let old: HashMap<String, String> = all
         .into_iter()
         .filter(|s| s.file_path == path)
         .map(|s| (s.name, s.body_hash))
@@ -123,6 +144,7 @@ pub fn spot_new_symbols_scoped(
         changed_symbols: changed.iter().map(|e| e.symbol.name.clone()).collect(),
         checked,
         advisories,
+        index_state: index_state.to_string(),
     })
 }
 
@@ -138,6 +160,7 @@ mod tests {
         let r = spot_new_symbols(dir.path(), &store, &WardConfig::default(), "README.md").unwrap();
         assert!(r.changed_symbols.is_empty());
         assert_eq!(r.checked, 0);
+        assert_eq!(r.index_state, "unchecked", "never consulted the index");
     }
 
     #[test]

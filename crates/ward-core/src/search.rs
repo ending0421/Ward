@@ -103,14 +103,25 @@ pub struct SpotResult {
     #[serde(default)]
     pub index_shared_from: Option<String>,
     /// The QUERY signature's specificity (issue #5): fraction of
-    /// domain-typed params. Legacy payloads deserialize to 0.0.
-    #[serde(default)]
-    pub query_specificity: f64,
+    /// domain-typed params. `None` when no query was ever evaluated — a
+    /// payload that cannot answer must not carry a fabricated measurement
+    /// (issue #17); the key is then ABSENT from the JSON, not `0.0`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query_specificity: Option<f64>,
     /// True when query_specificity is below the configured floor: matches
     /// are returned for humans but never graded Strong — automated gates
-    /// must treat the advisory as non-blocking.
+    /// must treat the advisory as non-blocking. `None` = not computed
+    /// (issue #17): absent from the JSON, because `false` on a
+    /// cannot-answer reads as "checked and confident".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub low_confidence: Option<bool>,
+    /// This payload is NOT an answer (issue #17): the index could not be
+    /// consulted (`index_state` missing/empty) or its staleness floor was
+    /// exceeded. Mirrors the CLI's exit-3 rule exactly, and drives
+    /// `ok: false` in both envelopes — a consumer that only reads stdout
+    /// must not be able to mistake it for "checked, no duplicates".
     #[serde(default)]
-    pub low_confidence: bool,
+    pub cannot_answer: bool,
     /// The original intent text (added for label context; older advisories
     /// lack it and deserialize to `None`).
     #[serde(default)]
@@ -120,6 +131,29 @@ pub struct SpotResult {
     /// content is by definition unmerged. Zero when no worktree is indexed.
     #[serde(default)]
     pub worktree_symbols: u64,
+}
+
+impl SpotResult {
+    /// Why this payload is not an answer, for the envelope's `error` field
+    /// (issue #17). One place decides, so the CLI envelope, the MCP envelope
+    /// and the exit code cannot drift apart.
+    pub fn refusal_reason(&self) -> String {
+        match self.index_state.as_str() {
+            "missing" => {
+                "无法作答：该仓库没有索引（先 `ward index`）——此载荷不是\"无重复\"证据（#6/#17）"
+                    .to_string()
+            }
+            "empty" => {
+                "无法作答：索引为空（0 符号，先 `ward index`）——此载荷不是\"无重复\"证据（#6/#17）"
+                    .to_string()
+            }
+            _ if self.stale_severe => format!(
+                "无法作答：索引严重滞后（{} commits behind）——请刷新后再信任（#7/#17）",
+                self.stale_commits.unwrap_or_default()
+            ),
+            _ => "无法作答（#17）".to_string(),
+        }
+    }
 }
 
 /// Advisory grade, with the discipline that text-only evidence can never be
@@ -423,8 +457,9 @@ pub fn spot(
         stale_commits: None,
         quick: false,
         index_shared_from: None,
-        query_specificity: 0.0,
-        low_confidence: false,
+        query_specificity: None,
+        low_confidence: None,
+        cannot_answer: true,
         query: Some(intent.to_string()),
         worktree_symbols: 0,
     };
@@ -441,8 +476,11 @@ pub fn spot(
                     return Ok(SpotResult {
                         quick: true,
                         index_state: "unchecked".into(),
-                        query_specificity: spec,
-                        low_confidence: true,
+                        // An honest answer, not a refusal: the query was
+                        // measured, the answer is just weak (#8).
+                        query_specificity: Some(spec),
+                        low_confidence: Some(true),
+                        cannot_answer: false,
                         ..missing("unchecked")
                     });
                 }
@@ -862,8 +900,9 @@ pub fn spot(
         index_shared_from: shared_from
             .as_ref()
             .map(|p| p.to_string_lossy().into_owned()),
-        query_specificity,
-        low_confidence,
+        query_specificity: Some(query_specificity),
+        low_confidence: Some(low_confidence),
+        cannot_answer: stale_severe,
         query: Some(intent.to_string()),
         worktree_symbols: symbols.iter().filter(|s| !s.worktree.is_empty()).count() as u64,
     };
@@ -918,8 +957,9 @@ pub fn parse_spot_payload(json: &str) -> Option<SpotResult> {
         stale_commits: None,
         quick: false,
         index_shared_from: None,
-        query_specificity: 0.0,
-        low_confidence: false,
+        query_specificity: None,
+        low_confidence: None,
+        cannot_answer: false,
         query: None,
         worktree_symbols: 0,
     })

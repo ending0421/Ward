@@ -370,6 +370,16 @@ enum Cmd {
     },
 }
 
+/// [`print_json`] for a REFUSAL (issue #17): `ok: false` + the reason, with
+/// the payload still attached so the consumer can read `index_state`.
+fn print_json_refused<T: serde::Serialize>(value: &T, reason: &str) -> anyhow::Result<()> {
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&ward_core::envelope::Envelope::refused(value, reason))?
+    );
+    Ok(())
+}
+
 /// CLI `--json` output shares the MCP `{ok, data}` envelope (issue #4):
 /// a consumer written against one surface must never silently read an
 /// empty set from the other.
@@ -495,11 +505,16 @@ fn main() -> Result<()> {
                 &options,
             )?;
             // Issue #7 contract: exit 3 = cannot answer honestly (missing/
-            // empty index, or a staleness floor exceeded).
-            let cannot_answer =
-                result.stale_severe || matches!(result.index_state.as_str(), "missing" | "empty");
+            // empty index, or a staleness floor exceeded). Issue #17: the
+            // payload says the same thing — `cannot_answer` is set by the
+            // engine, so exit code, envelope and fields cannot drift apart.
+            let cannot_answer = result.cannot_answer;
             if json {
-                print_json(&result)?;
+                if cannot_answer {
+                    print_json_refused(&result, &result.refusal_reason())?;
+                } else {
+                    print_json(&result)?;
+                }
             } else {
                 println!(
                     "spot advisory {} (as_of={:?}, stale={})",
@@ -549,6 +564,9 @@ fn main() -> Result<()> {
                         changed_symbols: vec![],
                         checked: 0,
                         advisories: vec![],
+                        // Issue #17: a fail-open report must not look like
+                        // "checked, nothing found".
+                        index_state: "missing".to_string(),
                     };
                     if json {
                         print_json(&report)?;

@@ -34,6 +34,19 @@ impl<T: Serialize> Envelope<T> {
         }
     }
 
+    /// A REFUSAL (issue #17): the tool ran, the payload is attached (it
+    /// explains itself via `index_state` / `cannot_answer`), but it is not an
+    /// answer — `ok: false` so a consumer that only reads stdout cannot read
+    /// a cannot-answer as "checked, found nothing". Distinct from [`err`],
+    /// which means "no result at all".
+    pub fn refused(data: T, reason: impl std::fmt::Display) -> Self {
+        Self {
+            ok: false,
+            error: Some(reason.to_string()),
+            data: Some(data),
+        }
+    }
+
     pub fn to_string_pretty(&self) -> Result<String, serde_json::Error> {
         serde_json::to_string_pretty(self)
     }
@@ -49,6 +62,17 @@ mod tests {
         assert!(json.contains("\"ok\": true"));
         assert!(json.contains("\"data\": 42"));
         assert!(!json.contains("error"));
+    }
+
+    #[test]
+    fn refused_envelope_carries_both_error_and_data() {
+        // Issue #17: ok:false AND data — the payload is the explanation.
+        let json = Envelope::refused(7, "cannot answer: no index")
+            .to_string_pretty()
+            .unwrap();
+        assert!(json.contains("\"ok\": false"));
+        assert!(json.contains("\"error\": \"cannot answer: no index\""));
+        assert!(json.contains("\"data\": 7"), "{json}");
     }
 
     #[test]

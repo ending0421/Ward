@@ -272,6 +272,60 @@ fn spot_exit_3_on_missing_index() {
     let json: serde_json::Value =
         serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).unwrap();
     assert_eq!(json["data"]["index_state"], "missing");
+    // Issue #17: the payload must not contradict the exit code. `ok: true`
+    // and `low_confidence: false` on a cannot-answer read as "checked, found
+    // nothing" to a consumer that only inspects stdout.
+    assert_eq!(json["ok"], serde_json::json!(false), "{json}");
+    assert!(
+        json["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("没有索引")),
+        "the refusal must explain itself: {json}"
+    );
+    assert_eq!(
+        json["data"]["cannot_answer"],
+        serde_json::json!(true),
+        "{json}"
+    );
+    assert!(
+        json["data"].get("low_confidence").is_none(),
+        "an uncomputed field must be absent, not false: {json}"
+    );
+    assert!(
+        json["data"].get("query_specificity").is_none(),
+        "an uncomputed field must be absent, not 0.0: {json}"
+    );
+}
+
+#[test]
+fn spot_json_is_ok_true_when_it_really_answered() {
+    // The other half of issue #17: a real answer keeps the ok envelope.
+    let repo = repo_with_rust();
+    let out = ward(&["index", "--repo", "."], repo.path());
+    assert!(out.status.success());
+    let out = ward(
+        &[
+            "spot",
+            "--repo",
+            ".",
+            "--intent",
+            "x",
+            "--signature",
+            "pub fn f() -> u8",
+            "--json",
+        ],
+        repo.path(),
+    );
+    assert_eq!(out.status.code(), Some(0));
+    let json: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).unwrap();
+    assert_eq!(json["ok"], serde_json::json!(true), "{json}");
+    assert_eq!(
+        json["data"]["cannot_answer"],
+        serde_json::json!(false),
+        "{json}"
+    );
+    assert!(json["data"].get("low_confidence").is_some(), "{json}");
 }
 
 #[test]

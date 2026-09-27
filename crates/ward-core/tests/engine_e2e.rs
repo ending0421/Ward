@@ -495,6 +495,9 @@ fn spot_file_checks_new_symbols_against_the_store() {
         "both symbols are new to the pre-write store"
     );
     assert_eq!(report.checked, 2);
+    // Issue #17: the report declares the index behind it — a fail-open
+    // report and "this write introduced nothing new" must not be identical.
+    assert_eq!(report.index_state, "fresh", "{report:?}");
     let debounce_adv = &report.advisories[0];
     assert!(
         debounce_adv
@@ -514,6 +517,39 @@ fn spot_file_checks_new_symbols_against_the_store() {
         again.changed_symbols.is_empty(),
         "unchanged file ⇒ no changed symbols: {:?}",
         again.changed_symbols
+    );
+    assert_eq!(
+        again.index_state, "fresh",
+        "checked against a live index: {again:?}"
+    );
+}
+
+#[test]
+fn spot_file_reports_a_stale_index_instead_of_silence() {
+    // Issue #17 (spot-file half): after a commit the index is behind — the
+    // report must say `stale`, and `checked: 0` with no changed symbols must
+    // still be distinguishable from "the index was never consulted".
+    let repo = TestRepo::new();
+    repo.write("src/lib.rs", "pub fn f() -> u8 { 0 }\n");
+    repo.commit_all("c1");
+    index::index_repo(repo.path(), &cfg()).unwrap();
+    let store = Store::open(&Store::default_path(repo.path())).unwrap();
+    // A write that introduces a symbol (so there IS something to check) plus
+    // a commit the index has not seen (so the index is behind).
+    repo.write(
+        "src/lib.rs",
+        "pub fn f() -> u8 { 0 }\npub fn g2() -> u8 { 1 }\n",
+    );
+    repo.write("src/other.rs", "pub fn g() -> u8 { 1 }\n");
+    repo.commit_all("c2");
+    let report =
+        ward_core::spotfile::spot_new_symbols(repo.path(), &store, &cfg(), "src/lib.rs").unwrap();
+    assert_eq!(report.changed_symbols, vec!["g2".to_string()], "{report:?}");
+    assert_eq!(report.index_state, "stale", "{report:?}");
+    assert!(!report.advisories.is_empty(), "{report:?}");
+    assert!(
+        report.advisories.iter().all(|a| a.stale),
+        "each advisory carries the same truth: {report:?}"
     );
 }
 
@@ -788,6 +824,63 @@ fn unindexed_repo_answers_missing_and_never_creates_an_index() {
         "spot must never create an index (issue #6)"
     );
     assert!(!r.repo_root.is_empty());
+    // Issue #17: the payload must not present template defaults as answers.
+    assert!(r.cannot_answer, "a missing index cannot answer");
+    assert_eq!(r.low_confidence, None, "never computed ⇒ absent, not false");
+    assert_eq!(
+        r.query_specificity, None,
+        "never computed ⇒ absent, not 0.0"
+    );
+    assert!(
+        r.refusal_reason().contains("没有索引"),
+        "{}",
+        r.refusal_reason()
+    );
+}
+
+#[test]
+fn refusal_payload_omits_uncomputed_fields() {
+    // Issue #17: on a cannot-answer, `low_confidence: false` / a 0.0
+    // specificity read as "checked and confident" to any consumer that only
+    // parses stdout. The keys must be ABSENT, and `cannot_answer` must say so
+    // in the payload itself (not only in the exit code).
+    let repo = TestRepo::new();
+    repo.write("src/lib.rs", "pub fn f() {}\n");
+    repo.commit_all("c1");
+    let r = search::spot(
+        repo.path(),
+        &cfg(),
+        "x",
+        Some("pub fn f() -> u8"),
+        None,
+        Some(Language::Rust),
+        &search::SpotOptions::default(),
+    )
+    .unwrap();
+    let v = serde_json::to_value(&r).unwrap();
+    assert!(v.get("low_confidence").is_none(), "{v}");
+    assert!(v.get("query_specificity").is_none(), "{v}");
+    assert_eq!(v["cannot_answer"], serde_json::json!(true), "{v}");
+    assert_eq!(v["index_state"], serde_json::json!("missing"), "{v}");
+
+    // An answered payload keeps both fields — the contract is unchanged
+    // where an answer exists.
+    index::index_repo(repo.path(), &cfg()).unwrap();
+    let r = search::spot(
+        repo.path(),
+        &cfg(),
+        "x",
+        Some("pub fn f() -> u8"),
+        None,
+        Some(Language::Rust),
+        &search::SpotOptions::default(),
+    )
+    .unwrap();
+    assert!(!r.cannot_answer);
+    let v = serde_json::to_value(&r).unwrap();
+    assert!(v.get("low_confidence").is_some(), "{v}");
+    assert!(v.get("query_specificity").is_some(), "{v}");
+    assert_eq!(v["cannot_answer"], serde_json::json!(false), "{v}");
 }
 
 #[test]
@@ -812,7 +905,10 @@ fn quick_path_answers_low_specificity_without_an_index() {
     .unwrap();
     assert!(r.quick);
     assert_eq!(r.index_state, "unchecked");
-    assert!(r.low_confidence);
+    // Issue #17: the quick path IS an answer (measured, just weak).
+    assert_eq!(r.low_confidence, Some(true));
+    assert!(r.query_specificity.is_some());
+    assert!(!r.cannot_answer);
     assert!(!repo.path().join(".ward/index.db").exists());
 }
 
@@ -1178,6 +1274,18 @@ fn staleness_severity_escalates_over_a_floor() {
     )
     .unwrap();
     assert!(r.stale_severe, "floor exceeded must escalate");
+    // Issue #17: a refused answer is flagged as such — but the measurement
+    // itself really happened, so it stays visible (unlike missing/empty).
+    assert!(
+        r.cannot_answer,
+        "severe staleness cannot be answered either"
+    );
+    assert!(r.low_confidence.is_some(), "the query WAS measured: {r:?}");
+    assert!(
+        r.refusal_reason().contains("严重滞后"),
+        "{}",
+        r.refusal_reason()
+    );
 }
 
 #[test]
@@ -1206,8 +1314,12 @@ fn low_specificity_signatures_are_flagged_and_never_strong() {
         },
     )
     .unwrap();
-    assert_eq!(r.query_specificity, 0.0);
-    assert!(r.low_confidence, "all-basic query must be low confidence");
+    assert_eq!(r.query_specificity, Some(0.0));
+    assert_eq!(
+        r.low_confidence,
+        Some(true),
+        "all-basic query must be low confidence"
+    );
     assert!(
         !r.matches.is_empty(),
         "matches are still returned for humans: {:?}",
@@ -1239,8 +1351,11 @@ fn low_specificity_signatures_are_flagged_and_never_strong() {
         },
     )
     .unwrap();
-    assert!(r.query_specificity >= 0.5, "domain-typed query: {r:?}");
-    assert!(!r.low_confidence);
+    assert!(
+        r.query_specificity.is_some_and(|v| v >= 0.5),
+        "domain-typed query: {r:?}"
+    );
+    assert_eq!(r.low_confidence, Some(false));
     let hit = r
         .matches
         .iter()
@@ -1454,7 +1569,10 @@ fn spot_on_empty_index_fails_open() {
     let repo = TestRepo::new();
     repo.write("src/lib.rs", "pub fn f() {}");
     repo.commit_all("c1");
-    // Never indexed: store exists but is empty.
+    // An index that EXISTS but holds 0 symbols (distinct from "missing":
+    // the store file is created here, nothing is indexed into it).
+    let _ = Store::open(&Store::default_path(repo.path())).unwrap();
+    assert!(Store::default_path(repo.path()).exists());
     let r = search::spot(
         repo.path(),
         &cfg(),
@@ -1470,6 +1588,11 @@ fn spot_on_empty_index_fails_open() {
     .unwrap();
     assert!(r.matches.is_empty());
     assert!(r.stale, "empty index must report stale");
+    // Issue #17: 0 symbols is also a cannot-answer, and says so.
+    assert_eq!(r.index_state, "empty");
+    assert!(r.cannot_answer);
+    assert_eq!(r.low_confidence, None);
+    assert_eq!(r.query_specificity, None);
 }
 
 // -------------------------------------------------------------- diff.rs

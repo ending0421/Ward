@@ -201,6 +201,13 @@ impl WardMcp {
             &options,
         );
         match result {
+            // Issue #17: MCP has no exit code, so the envelope is the only
+            // machine signal a cannot-answer has — it must not say `ok:true`.
+            Ok(r) if r.cannot_answer => {
+                let reason = r.refusal_reason();
+                serde_json::to_string_pretty(&ToolEnvelope::refused(r, reason))
+                    .unwrap_or_else(|_| r#"{"ok":false,"error":"serialize failed"}"#.into())
+            }
             Ok(r) => tool_ok(r),
             Err(e) => tool_err(format!("spot failed (fail-open): {e}")),
         }
