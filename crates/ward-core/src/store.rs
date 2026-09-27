@@ -559,9 +559,13 @@ impl Store {
     /// memory by design — 10⁴–10⁵ symbols, spec §4).
     pub fn all_symbols(&self) -> Result<Vec<Symbol>> {
         let mut stmt = self.conn.prepare(
+            // Ordered: match ordering must not depend on the filesystem's
+            // enumeration order during indexing (Linux and macOS disagreed,
+            // and a gate's output has to be reproducible — CI caught it).
             "SELECT id, file_path, module, worktree, worktree_branch, language, name, kind, start_byte,
                     end_byte, body_hash, struct_hash, simhash, sig_simhash, in_test, commit_sha
-             FROM symbols",
+             FROM symbols
+             ORDER BY worktree, file_path, start_byte, name",
         )?;
         let rows = stmt.query_map([], row_to_symbol)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)

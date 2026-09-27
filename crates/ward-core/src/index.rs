@@ -149,7 +149,7 @@ fn walk_for_symbols(
 /// Resolve a declaration's name node: prefer the spec's name field, then
 /// fall back to the first identifier-kind named child (grammars differ in
 /// field wiring — Kotlin/ObjC declare the name without a `name` field).
-fn name_node_of<'a>(node: &'a Node, spec: &LanguageSpec) -> Option<Node<'a>> {
+pub(crate) fn name_node_of<'a>(node: &'a Node, spec: &LanguageSpec) -> Option<Node<'a>> {
     if let Some(n) = node.child_by_field_name(spec.name_field) {
         return Some(n);
     }

@@ -286,6 +286,12 @@ fn symbol_specificity(root: &Path, m: &SpotMatch) -> f64 {
     crate::specificity::signature_specificity(lang, line).unwrap_or(0.0)
 }
 
+/// UTF-8 text of a node inside `src` (the query source, kept alive by the
+/// caller's borrow of the fingerprint text).
+fn node_text(node: &tree_sitter::Node<'_>, src: &str) -> Option<String> {
+    node.utf8_text(src.as_bytes()).ok().map(|s| s.to_string())
+}
+
 /// Root a hit's coordinates resolve against: the main checkout, or the
 /// linked worktree it was indexed from (issue #12).
 fn root_of(repo: &Path, worktree: &str) -> std::path::PathBuf {
@@ -490,6 +496,24 @@ pub fn spot(
     let query_sim = parsed
         .as_ref()
         .and_then(|(lang, t)| fingerprint::signature_simhash(t, lang.spec()));
+    // The name the query declares (issue #15 follow-up): among hits the
+    // fingerprints cannot separate, the one carrying the SAME NAME is the
+    // original the copy came from — a same-shape sibling is not. Without it
+    // the winner was decided by filesystem enumeration order.
+    let query_name: Option<String> = parsed.as_ref().and_then(|(lang, t)| {
+        let src = fingerprint_text?;
+        let root = t.root_node();
+        let mut cursor = root.walk();
+        let node = root.named_children(&mut cursor).next()?;
+        let name = crate::index::name_node_of(&node, lang.spec())?;
+        node_text(&name, src)
+    });
+    let name_rank = |m: &SpotMatch| -> u8 {
+        match &query_name {
+            Some(q) if &m.symbol == q => 0,
+            _ => 1,
+        }
+    };
     // Issue #5: low-specificity signatures (all basic/std param types)
     // degenerate to shape-only fingerprints and flood false positives.
     // Compute the specificity once and expose it + the gate flag.
@@ -558,7 +582,19 @@ pub fn spot(
                 .map(|(i, s)| (i, fingerprint::simhash_similarity(q, s.sig_simhash)))
                 .filter(|(_, sim)| *sim >= config.thresholds.weak)
                 .collect();
-            near.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            near.sort_by(|a, b| {
+                b.1.partial_cmp(&a.1)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| {
+                        let named = |i: usize| match &query_name {
+                            Some(q) if &symbols[i].name == q => 0u8,
+                            _ => 1,
+                        };
+                        named(a.0).cmp(&named(b.0))
+                    })
+                    .then_with(|| symbols[a.0].file_path.cmp(&symbols[b.0].file_path))
+                    .then_with(|| symbols[a.0].name.cmp(&symbols[b.0].name))
+            });
             // Only materialize what can still fit under top_k: each push
             // reads the hit file for its line range (F11).
             let budget = config.top_k.saturating_sub(matches.len());
@@ -650,7 +686,13 @@ pub fn spot(
             }
         }
     }
-    ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    ranked.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| name_rank(&a.0).cmp(&name_rank(&b.0)))
+            .then_with(|| a.0.path.cmp(&b.0.path))
+            .then_with(|| a.0.symbol.cmp(&b.0.symbol))
+    });
 
     for (mut m, sim) in ranked {
         let mut g = grade(&m.kind, sim, config);

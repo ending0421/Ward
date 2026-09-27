@@ -680,10 +680,13 @@ fn replay_skips_non_code_files() {
 fn verbatim_copy_matches_its_own_original() {
     // Issue #15: the strongest duplication signal a gate can receive — a
     // character-for-character copy — must surface the original, not be
-    // evicted by same-shape siblings.
+    // evicted by same-shape siblings. The original lives in the file that
+    // sorts LAST on purpose: only the same-name tie-break can put it first,
+    // so the assertion cannot pass by alphabetical luck (CI ran on Linux
+    // where enumeration order differs — the winner used to be arbitrary).
     let repo = TestRepo::new();
     repo.write(
-        "src/original.rs",
+        "src/zz_original.rs",
         "pub struct Frame { pub w: f32 }\n\npub fn unique_renderer_helper(frame: &Frame, scale: f32) -> f32 { frame.w * scale }\n",
     );
     // Same-shape siblings that used to outrank the true original.
