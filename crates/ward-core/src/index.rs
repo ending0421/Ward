@@ -36,7 +36,26 @@ pub struct IndexReport {
     pub files_unparsable: usize,
     /// Files suppressed via `.ward/config.toml`.
     pub files_suppressed: usize,
+    /// Files indexed from linked worktrees (issue #12).
+    pub worktree_files_indexed: usize,
+    /// Symbols indexed from linked worktrees (issue #12).
+    pub worktree_symbols_indexed: usize,
     pub commit_sha: Option<String>,
+}
+
+impl IndexReport {
+    /// Attribute one indexed file to the main checkout or to a worktree
+    /// (issue #12): the two are reported separately so `ward index` can show
+    /// that unmerged provenance was collected (and how much).
+    pub(crate) fn count_file(&mut self, worktree: &str, symbols: usize) {
+        if worktree.is_empty() {
+            self.files_indexed += 1;
+            self.symbols_indexed += symbols;
+        } else {
+            self.worktree_files_indexed += 1;
+            self.worktree_symbols_indexed += symbols;
+        }
+    }
 }
 
 /// One extracted symbol plus the identifier mentions inside its own body —
@@ -160,6 +179,8 @@ fn symbol_from_node(
         id: None,
         file_path: String::new(), // filled in by the caller
         module: String::new(),
+        worktree: String::new(),        // filled in by the caller (index_all)
+        worktree_branch: String::new(), // filled in by the caller
         language: spec.lang.as_str().to_string(),
         name,
         kind: node.kind().to_string(),
@@ -353,57 +374,168 @@ impl Indexer<'_> {
                 .unwrap_or(&path)
                 .to_string_lossy()
                 .into_owned();
-            if self.config.is_suppressed(&rel) {
-                report.files_suppressed += 1;
-                continue;
-            }
-            // UDL interface files (spec §3.0 contract, 0.5-2): no tree-sitter
-            // grammar exists, so the thin hand-rolled extractor supplies the
-            // symbols. The interface surface is ALWAYS indexed (it is the
-            // cross-language contract, not a language choice).
-            if rel.ends_with(".udl") {
-                let Ok(source) = std::fs::read_to_string(&path) else {
-                    continue;
-                };
-                let module = module_of(self.repo_root, &rel, &mut module_cache);
-                let defs = crate::udl::extract(&source);
-                let symbols: Vec<Symbol> = defs
-                    .iter()
-                    .map(|d| Symbol {
-                        id: None,
-                        file_path: rel.clone(),
-                        module: module.clone(),
-                        language: "udl".to_string(),
-                        name: d.name.clone(),
-                        kind: d.kind.clone(),
-                        start_byte: d.start_byte as i64,
-                        end_byte: d.end_byte as i64,
-                        body_hash: crate::udl::declaration_hash(d),
-                        struct_hash: crate::udl::declaration_hash(d),
-                        simhash: crate::udl::declaration_simhash(d),
-                        sig_simhash: crate::udl::declaration_simhash(d),
-                        in_test: false,
-                        commit_sha: sha.clone(),
-                    })
-                    .collect();
-                self.store.replace_file(&rel, &symbols)?;
-                report.files_indexed += 1;
-                report.symbols_indexed += symbols.len();
-                continue;
-            }
-            let Some(lang) = Language::from_path(&path) else {
-                continue;
+            self.index_file_at(&path, &rel, "", "", &sha, &mut module_cache, &mut report)?;
+        }
+        if self.config.index.include_worktrees {
+            self.index_worktrees(&sha, &mut module_cache, &mut report)?;
+        } else {
+            // Flag off ⇒ worktree provenance is unwanted state: purge it so
+            // a stale `--include-worktrees` run cannot leave phantom hits.
+            self.store.prune_worktrees(&[])?;
+        }
+        if let Some(sha) = &report.commit_sha {
+            self.store.set_last_indexed_sha(sha)?;
+        }
+        Ok(report)
+    }
+
+    /// Index one file (main checkout or a linked worktree). `worktree` is
+    /// the absolute worktree root and `branch` its checked-out branch, both
+    /// `""` for the main checkout (issue #12: provenance travels with the
+    /// symbols; deletes are scoped by it).
+    #[allow(clippy::too_many_arguments)]
+    fn index_file_at(
+        &mut self,
+        path: &Path,
+        rel: &str,
+        worktree: &str,
+        branch: &str,
+        sha: &str,
+        module_cache: &mut HashMap<PathBuf, Option<String>>,
+        report: &mut IndexReport,
+    ) -> Result<()> {
+        if self.config.is_suppressed(rel) {
+            report.files_suppressed += 1;
+            return Ok(());
+        }
+        // UDL interface files (spec §3.0 contract, 0.5-2): no tree-sitter
+        // grammar exists, so the thin hand-rolled extractor supplies the
+        // symbols. The interface surface is ALWAYS indexed (it is the
+        // cross-language contract, not a language choice).
+        if rel.ends_with(".udl") {
+            let Ok(source) = std::fs::read_to_string(path) else {
+                return Ok(());
             };
-            if !self.config.is_language_enabled(lang) {
-                report.files_skipped_language += 1;
-                continue;
+            let module = module_of(self.repo_root, rel, module_cache);
+            let defs = crate::udl::extract(&source);
+            let symbols: Vec<Symbol> = defs
+                .iter()
+                .map(|d| Symbol {
+                    id: None,
+                    file_path: rel.to_string(),
+                    module: module.clone(),
+                    worktree: worktree.to_string(),
+                    worktree_branch: branch.to_string(),
+                    language: "udl".to_string(),
+                    name: d.name.clone(),
+                    kind: d.kind.clone(),
+                    start_byte: d.start_byte as i64,
+                    end_byte: d.end_byte as i64,
+                    body_hash: crate::udl::declaration_hash(d),
+                    struct_hash: crate::udl::declaration_hash(d),
+                    simhash: crate::udl::declaration_simhash(d),
+                    sig_simhash: crate::udl::declaration_simhash(d),
+                    in_test: false,
+                    commit_sha: sha.to_string(),
+                })
+                .collect();
+            self.store.replace_file_scoped(worktree, rel, &symbols)?;
+            report.count_file(worktree, symbols.len());
+            return Ok(());
+        }
+        let Some(lang) = Language::from_path(path) else {
+            return Ok(());
+        };
+        if !self.config.is_language_enabled(lang) {
+            report.files_skipped_language += 1;
+            return Ok(());
+        }
+        let Some(grammar) = lang.ts_language() else {
+            report.files_skipped_language += 1;
+            return Ok(());
+        };
+        // Incremental skip: mtime+size unchanged ⇒ content unchanged.
+        if let Ok(meta) = std::fs::metadata(path) {
+            let mtime = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            let size = meta.len() as i64;
+            if self.store.get_file_meta_scoped(worktree, rel)? == Some((mtime, size)) {
+                report.files_unchanged += 1;
+                return Ok(());
             }
-            let Some(grammar) = lang.ts_language() else {
-                report.files_skipped_language += 1;
-                continue;
-            };
-            // Incremental skip: mtime+size unchanged ⇒ content unchanged.
-            if let Ok(meta) = std::fs::metadata(&path) {
+        }
+        let source = match std::fs::read_to_string(path) {
+            Ok(s) => s,
+            Err(_) => return Ok(()), // unreadable file: skip, fail-open
+        };
+        let spec = lang.spec();
+        let mut parser = tree_sitter::Parser::new();
+        if parser.set_language(&grammar).is_err() {
+            report.files_skipped_language += 1;
+            return Ok(());
+        }
+        let Some(tree) = parser.parse(&source, None) else {
+            report.files_unparsable += 1;
+            return Ok(()); // F3
+        };
+        // Tolerant parsers return trees even for broken files; a tree
+        // with syntax errors would feed garbage symbols, so F3 treats it
+        // as unparsable (full-file skip, everything else keeps working).
+        if tree.root_node().has_error() {
+            report.files_unparsable += 1;
+            return Ok(());
+        }
+
+        let mut extracted = extract_symbols(&tree, &source, spec);
+        let path_in_test = rel.split('/').any(|seg| seg == "tests");
+        if path_in_test {
+            for e in &mut extracted {
+                e.symbol.in_test = true;
+            }
+        }
+        let module = module_of(self.repo_root, rel, module_cache);
+        let mut symbols: Vec<Symbol> = Vec::with_capacity(extracted.len());
+        for e in &extracted {
+            let mut sym = e.symbol.clone();
+            sym.file_path = rel.to_string();
+            sym.module = module.clone();
+            sym.worktree = worktree.to_string();
+            sym.worktree_branch = branch.to_string();
+            sym.commit_sha = sha.to_string();
+            symbols.push(sym);
+        }
+        let ids = self.store.replace_file_scoped(worktree, rel, &symbols)?;
+        let mention_rows: Vec<(i64, Vec<String>)> = ids
+            .iter()
+            .zip(&extracted)
+            .filter(|(_, e)| !e.mentions.is_empty())
+            .map(|(id, e)| (*id, e.mentions.clone()))
+            .collect();
+        if !mention_rows.is_empty() {
+            // One transaction for the whole file: per-symbol commits
+            // were 93% of full-index time at 10⁵ symbols (F11).
+            self.store.set_mentions_batch(&mention_rows)?;
+        }
+
+        // Block-level fingerprints stay main-checkout only (issue #12
+        // non-goal): a worktree's uncommitted blocks would otherwise
+        // overwrite the committed block layer for the same path.
+        if worktree.is_empty() {
+            let mut blocks = extract_blocks(&tree, &source);
+            for b in &mut blocks {
+                b.file_path = rel.to_string();
+                b.commit_sha = sha.to_string();
+            }
+            report.blocks_indexed += blocks.len();
+            self.store.replace_blocks(rel, &blocks)?;
+        }
+
+        if let Some(h) = crate::git::file_hash(path) {
+            if let Ok(meta) = std::fs::metadata(path) {
                 let mtime = meta
                     .modified()
                     .ok()
@@ -411,92 +543,71 @@ impl Indexer<'_> {
                     .map(|d| d.as_secs() as i64)
                     .unwrap_or(0);
                 let size = meta.len() as i64;
-                if self.store.get_file_meta(&rel)? == Some((mtime, size)) {
-                    report.files_unchanged += 1;
+                self.store
+                    .set_file_meta_scoped(worktree, rel, &h, mtime, size)?;
+            } else {
+                self.store.set_file_hash_scoped(worktree, rel, &h)?;
+            }
+        }
+        report.count_file(worktree, symbols.len());
+
+        Ok(())
+    }
+
+    /// Index linked worktrees' new-vs-merge-base files (issue #12).
+    fn index_worktrees(
+        &mut self,
+        sha: &str,
+        module_cache: &mut HashMap<PathBuf, Option<String>>,
+        report: &mut IndexReport,
+    ) -> Result<()> {
+        let Some(main_head) = crate::git::head_sha(self.repo_root)? else {
+            return Ok(());
+        };
+        // `git worktree list` includes the main checkout, whose uncommitted
+        // edits ARE the working tree the main index already tracks: indexing
+        // them as "worktree" provenance would relabel every local edit as
+        // unmerged (issue #12 correctness, not just tidiness).
+        let main_root = self
+            .repo_root
+            .canonicalize()
+            .unwrap_or_else(|_| self.repo_root.to_path_buf());
+        let worktrees: Vec<(PathBuf, Option<String>)> = crate::git::list_worktrees(self.repo_root)?
+            .into_iter()
+            .filter(|(p, _)| p.canonicalize().map(|c| c != main_root).unwrap_or(true))
+            .collect();
+        let live: Vec<String> = worktrees
+            .iter()
+            .filter_map(|(p, _)| p.canonicalize().ok())
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
+        // Worktrees that vanished keep no symbols (transience, issue #12).
+        self.store.prune_worktrees(&live)?;
+        for (root, branch) in worktrees {
+            let branch = branch.unwrap_or_default();
+            let Ok(root_abs) = root.canonicalize() else {
+                continue;
+            };
+            let root_s = root_abs.to_string_lossy().into_owned();
+            let Some(base) = crate::git::merge_base(&root_abs, &main_head) else {
+                continue; // unrelated histories: nothing meaningful to diff
+            };
+            let mut rels = crate::git::diff_names(&root_abs, &base, "HEAD").unwrap_or_default();
+            rels.extend(crate::git::status_paths(&root_abs));
+            rels.sort();
+            rels.dedup();
+            for rel in rels {
+                if Language::from_path(Path::new(&rel)).is_none() && !rel.ends_with(".udl") {
                     continue;
                 }
-            }
-            let source = match std::fs::read_to_string(&path) {
-                Ok(s) => s,
-                Err(_) => continue, // unreadable file: skip, fail-open
-            };
-            let spec = lang.spec();
-            let mut parser = tree_sitter::Parser::new();
-            if parser.set_language(&grammar).is_err() {
-                report.files_skipped_language += 1;
-                continue;
-            }
-            let Some(tree) = parser.parse(&source, None) else {
-                report.files_unparsable += 1;
-                continue; // F3
-            };
-            // Tolerant parsers return trees even for broken files; a tree
-            // with syntax errors would feed garbage symbols, so F3 treats it
-            // as unparsable (full-file skip, everything else keeps working).
-            if tree.root_node().has_error() {
-                report.files_unparsable += 1;
-                continue;
-            }
-
-            let mut extracted = extract_symbols(&tree, &source, spec);
-            let path_in_test = rel.split('/').any(|seg| seg == "tests");
-            if path_in_test {
-                for e in &mut extracted {
-                    e.symbol.in_test = true;
+                let abs = root_abs.join(&rel);
+                if !abs.is_file() {
+                    continue;
                 }
+                self.index_file_at(&abs, &rel, &root_s, &branch, sha, module_cache, report)?;
             }
-            let module = module_of(self.repo_root, &rel, &mut module_cache);
-            let mut symbols: Vec<Symbol> = Vec::with_capacity(extracted.len());
-            for e in &extracted {
-                let mut sym = e.symbol.clone();
-                sym.file_path = rel.clone();
-                sym.module = module.clone();
-                sym.commit_sha = sha.clone();
-                symbols.push(sym);
-            }
-            let ids = self.store.replace_file(&rel, &symbols)?;
-            let mention_rows: Vec<(i64, Vec<String>)> = ids
-                .iter()
-                .zip(&extracted)
-                .filter(|(_, e)| !e.mentions.is_empty())
-                .map(|(id, e)| (*id, e.mentions.clone()))
-                .collect();
-            if !mention_rows.is_empty() {
-                // One transaction for the whole file: per-symbol commits
-                // were 93% of full-index time at 10⁵ symbols (F11).
-                self.store.set_mentions_batch(&mention_rows)?;
-            }
-
-            let mut blocks = extract_blocks(&tree, &source);
-            for b in &mut blocks {
-                b.file_path = rel.clone();
-                b.commit_sha = sha.clone();
-            }
-            report.blocks_indexed += blocks.len();
-            self.store.replace_blocks(&rel, &blocks)?;
-
-            if let Some(h) = crate::git::file_hash(&path) {
-                if let Ok(meta) = std::fs::metadata(&path) {
-                    let mtime = meta
-                        .modified()
-                        .ok()
-                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                        .map(|d| d.as_secs() as i64)
-                        .unwrap_or(0);
-                    let size = meta.len() as i64;
-                    self.store.set_file_meta(&rel, &h, mtime, size)?;
-                } else {
-                    self.store.set_file_hash(&rel, &h)?;
-                }
-            }
-            report.files_indexed += 1;
-            report.symbols_indexed += symbols.len();
         }
-
-        if let Some(sha) = &report.commit_sha {
-            self.store.set_last_indexed_sha(sha)?;
-        }
-        Ok(report)
+        Ok(())
     }
 
     fn collect_files(&self) -> Result<Vec<PathBuf>> {

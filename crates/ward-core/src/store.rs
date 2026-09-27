@@ -10,7 +10,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 /// Current schema version. Bump on any schema change; mismatches trigger a
 /// full rebuild instead of a migration (rebuild is cheap and always safe).
-pub const SCHEMA_VERSION: i64 = 8;
+pub const SCHEMA_VERSION: i64 = 9;
 
 /// One indexed symbol (function / struct / enum / trait / method, …).
 #[derive(Debug, Clone, PartialEq)]
@@ -21,6 +21,13 @@ pub struct Symbol {
     /// belongs to (Cargo package name, Gradle module dir, SwiftPM package
     /// dir, or the repo-root-relative top-level dir). Empty when unknown.
     pub module: String,
+    /// Absolute root of the linked worktree this symbol came from (issue
+    /// #12); empty for the main checkout.
+    pub worktree: String,
+    /// Branch checked out in that worktree (issue #12): the actionable name
+    /// for a human/agent reader — an absolute path alone does not say which
+    /// line of work the unmerged duplicate belongs to.
+    pub worktree_branch: String,
     pub language: String,
     pub name: String,
     pub kind: String,
@@ -87,6 +94,9 @@ pub struct Ack {
 /// One label-matrix row: (language, kind, verdict, count, avg_similarity).
 pub type LabelRow = (String, String, String, i64, f64);
 
+/// One funnel-classification row: (id, ts, result_json, inferred_action).
+pub type AdvisoryFactRow = (String, i64, String, Option<String>);
+
 /// One advisory row for reporting: (ts, query_hash, result_json,
 /// agent_action, inferred_action, inferred_commit_sha).
 pub type AdvisoryRow = (
@@ -145,6 +155,17 @@ pub struct Store {
     bm25: std::cell::RefCell<Option<std::rc::Rc<crate::search::Bm25>>>,
 }
 
+/// Does `name` exist as a table? Used to tell "fresh database" from
+/// "index written by an older release" before any DDL runs.
+fn table_exists(conn: &Connection, name: &str) -> Result<bool> {
+    let n: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+        params![name],
+        |r| r.get(0),
+    )?;
+    Ok(n > 0)
+}
+
 fn create_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         r#"
@@ -161,6 +182,11 @@ fn create_schema(conn: &Connection) -> Result<()> {
             id          INTEGER PRIMARY KEY,
             file_path   TEXT NOT NULL,
             module      TEXT NOT NULL DEFAULT '',
+            -- Absolute root of the linked worktree this symbol came from
+            -- (issue #12); '' = the main checkout.
+            worktree    TEXT NOT NULL DEFAULT '',
+            -- Branch checked out in that worktree (issue #12).
+            worktree_branch TEXT NOT NULL DEFAULT '',
             language    TEXT NOT NULL,
             name        TEXT NOT NULL,
             kind        TEXT NOT NULL,
@@ -177,6 +203,7 @@ fn create_schema(conn: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_symbols_lang ON symbols(language);
         CREATE INDEX IF NOT EXISTS idx_symbols_file ON symbols(file_path);
         CREATE INDEX IF NOT EXISTS idx_symbols_name ON symbols(name);
+        CREATE INDEX IF NOT EXISTS idx_symbols_worktree ON symbols(worktree);
 
         -- spec §4: block fingerprints (populated from Phase 1)
         CREATE TABLE IF NOT EXISTS blocks (
@@ -305,27 +332,42 @@ impl Store {
         }
         let conn =
             Connection::open(path).with_context(|| format!("opening index {}", path.display()))?;
-        create_schema(&conn)?;
+        // The stamp is read BEFORE any DDL: on an older schema, `CREATE TABLE
+        // IF NOT EXISTS` silently keeps the old column set while the new
+        // indexes reference columns that do not exist yet — the first run
+        // against a v(N-1) index would fail instead of rebuilding (caught by
+        // the v8→v9 upgrade, issue #12).
         let version: Option<i64> = conn
             .query_row(
                 "SELECT value FROM meta WHERE key = 'schema_version'",
                 [],
-                |r| r.get(0),
+                |r| r.get::<_, String>(0),
             )
-            .optional()?
-            .and_then(|v: String| v.parse().ok());
+            .optional()
+            .ok()
+            .flatten()
+            .and_then(|v| v.parse().ok());
+        let initialized = version.is_some() || table_exists(&conn, "symbols")?;
         match version {
+            Some(v) if v != SCHEMA_VERSION => {
+                tracing::warn!("index schema version {v} != {SCHEMA_VERSION}; rebuilding (F1)");
+                Self::reset(&conn)?;
+            }
+            // A versioned, current schema: DDL is idempotent and only adds
+            // tables/indexes introduced since (governance additive policy).
+            Some(_) => create_schema(&conn)?,
+            // An index from a release that predates the stamp: rebuild.
+            None if initialized => {
+                tracing::warn!("index schema is unversioned; rebuilding (F1)");
+                Self::reset(&conn)?;
+            }
             None => {
+                create_schema(&conn)?;
                 conn.execute(
                     "INSERT INTO meta (key, value) VALUES ('schema_version', ?1)",
                     params![SCHEMA_VERSION.to_string()],
                 )?;
             }
-            Some(v) if v != SCHEMA_VERSION => {
-                tracing::warn!("index schema version {v} != {SCHEMA_VERSION}; rebuilding (F1)");
-                Self::reset(&conn)?;
-            }
-            Some(_) => {}
         }
         // Lightweight integrity check on open (F1 detection).
         let integrity: String = conn.query_row("PRAGMA quick_check", [], |r| r.get(0))?;
@@ -348,11 +390,18 @@ impl Store {
     fn reset(conn: &Connection) -> Result<()> {
         const GOVERNANCE: &[&str] = &["advisories", "labels", "snapshots", "contract_runs", "acks"];
         conn.execute_batch("BEGIN;")?;
+        // Only what exists can be carried across: a pre-governance index (or
+        // one from a release before `acks`) rebuilds without those tables.
+        let mut carried: Vec<&str> = Vec::new();
         for table in GOVERNANCE {
+            if !table_exists(conn, table)? {
+                continue;
+            }
             conn.execute_batch(&format!(
                 "DROP TABLE IF EXISTS ward_bak_{table};
                  CREATE TABLE ward_bak_{table} AS SELECT * FROM {table};"
             ))?;
+            carried.push(table);
         }
         conn.execute_batch(
             "DROP TABLE IF EXISTS symbols;
@@ -363,6 +412,7 @@ impl Store {
              DROP TABLE IF EXISTS labels;
              DROP TABLE IF EXISTS snapshots;
              DROP TABLE IF EXISTS contract_runs;
+             DROP TABLE IF EXISTS acks;
              DROP TABLE IF EXISTS file_hashes;
              DROP TABLE IF EXISTS meta;",
         )?;
@@ -370,7 +420,7 @@ impl Store {
         // labels gained `annotator` in schema v6: copy column-explicit so a
         // v5 backup lands with the default annotator. The other governance
         // tables keep the `SELECT *` copy (additive-only policy).
-        for table in GOVERNANCE {
+        for table in &carried {
             if *table == "labels" {
                 conn.execute_batch(
                     "INSERT INTO labels
@@ -407,24 +457,37 @@ impl Store {
     /// Returns the inserted row ids in insertion order (used to attach
     /// per-symbol mention edges).
     pub fn replace_file(&mut self, file_path: &str, symbols: &[Symbol]) -> Result<Vec<i64>> {
+        self.replace_file_scoped("", file_path, symbols)
+    }
+
+    /// [`replace_file`] scoped to a worktree root (issue #12): the DELETE
+    /// must not touch the same relative path in another checkout.
+    pub fn replace_file_scoped(
+        &mut self,
+        worktree: &str,
+        file_path: &str,
+        symbols: &[Symbol],
+    ) -> Result<Vec<i64>> {
         // The BM25 recall index is derived from the symbol table — drop it,
         // the next query rebuilds it against this state.
         *self.bm25.borrow_mut() = None;
         let tx = self.conn.transaction()?;
         tx.execute(
-            "DELETE FROM symbols WHERE file_path = ?1",
-            params![file_path],
+            "DELETE FROM symbols WHERE file_path = ?1 AND worktree = ?2",
+            params![file_path, worktree],
         )?;
         let mut ids = Vec::with_capacity(symbols.len());
         for s in symbols {
             tx.execute(
                 "INSERT INTO symbols
-                   (file_path, module, language, name, kind, start_byte, end_byte,
+                   (file_path, module, worktree, worktree_branch, language, name, kind, start_byte, end_byte,
                     body_hash, struct_hash, simhash, sig_simhash, in_test, commit_sha)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
                 params![
                     s.file_path,
                     s.module,
+                    s.worktree,
+                    s.worktree_branch,
                     s.language,
                     s.name,
                     s.kind,
@@ -496,8 +559,8 @@ impl Store {
     /// memory by design — 10⁴–10⁵ symbols, spec §4).
     pub fn all_symbols(&self) -> Result<Vec<Symbol>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, file_path, module, language, name, kind, start_byte, end_byte,
-                    body_hash, struct_hash, simhash, sig_simhash, in_test, commit_sha
+            "SELECT id, file_path, module, worktree, worktree_branch, language, name, kind, start_byte,
+                    end_byte, body_hash, struct_hash, simhash, sig_simhash, in_test, commit_sha
              FROM symbols",
         )?;
         let rows = stmt.query_map([], row_to_symbol)?;
@@ -507,8 +570,8 @@ impl Store {
     /// Symbols with an exact L1 structural match.
     pub fn symbols_by_struct_hash(&self, hash: &str) -> Result<Vec<Symbol>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, file_path, module, language, name, kind, start_byte, end_byte,
-                    body_hash, struct_hash, simhash, sig_simhash, in_test, commit_sha
+            "SELECT id, file_path, module, worktree, worktree_branch, language, name, kind, start_byte,
+                    end_byte, body_hash, struct_hash, simhash, sig_simhash, in_test, commit_sha
              FROM symbols WHERE struct_hash = ?1",
         )?;
         let rows = stmt.query_map(params![hash], row_to_symbol)?;
@@ -846,6 +909,75 @@ impl Store {
 
     // ---- freshness (spec §5) ---------------------------------------------
 
+    /// File-hash key including worktree provenance (issue #12): the main
+    /// checkout keeps its bare path, worktree entries are namespaced.
+    fn scoped_key(worktree: &str, file_path: &str) -> String {
+        if worktree.is_empty() {
+            file_path.to_string()
+        } else {
+            format!("{worktree}\u{1}{file_path}")
+        }
+    }
+
+    pub fn set_file_hash_scoped(&self, worktree: &str, file_path: &str, hash: &str) -> Result<()> {
+        self.set_file_hash(&Self::scoped_key(worktree, file_path), hash)
+    }
+
+    pub fn set_file_meta_scoped(
+        &self,
+        worktree: &str,
+        file_path: &str,
+        hash: &str,
+        mtime: i64,
+        size: i64,
+    ) -> Result<()> {
+        self.set_file_meta(&Self::scoped_key(worktree, file_path), hash, mtime, size)
+    }
+
+    pub fn get_file_meta_scoped(
+        &self,
+        worktree: &str,
+        file_path: &str,
+    ) -> Result<Option<(i64, i64)>> {
+        self.get_file_meta(&Self::scoped_key(worktree, file_path))
+    }
+
+    pub fn get_file_hash_scoped(&self, worktree: &str, file_path: &str) -> Result<Option<String>> {
+        self.get_file_hash(&Self::scoped_key(worktree, file_path))
+    }
+
+    /// Drop every symbol and freshness key belonging to a worktree that no
+    /// longer exists (issue #12: worktrees are created and deleted
+    /// constantly; dead provenance must not linger as invisible hits).
+    pub fn prune_worktrees(&mut self, live: &[String]) -> Result<usize> {
+        let known: std::collections::BTreeSet<String> = {
+            let mut stmt = self
+                .conn
+                .prepare("SELECT DISTINCT worktree FROM symbols WHERE worktree != ''")?;
+            let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+            rows.collect::<rusqlite::Result<_>>()?
+        };
+        let dead: Vec<String> = known
+            .into_iter()
+            .filter(|w| !live.iter().any(|l| l == w))
+            .collect();
+        if dead.is_empty() {
+            return Ok(0);
+        }
+        *self.bm25.borrow_mut() = None;
+        let tx = self.conn.transaction()?;
+        let mut removed = 0usize;
+        for w in &dead {
+            removed += tx.execute("DELETE FROM symbols WHERE worktree = ?1", params![w])?;
+            tx.execute(
+                "DELETE FROM file_hashes WHERE file_path LIKE ?1",
+                params![format!("{w}\u{1}%")],
+            )?;
+        }
+        tx.commit()?;
+        Ok(removed)
+    }
+
     pub fn set_file_hash(&self, file_path: &str, hash: &str) -> Result<()> {
         self.conn.execute(
             "INSERT INTO file_hashes (file_path, hash) VALUES (?1, ?2)
@@ -1040,6 +1172,17 @@ impl Store {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
+    /// Every spot advisory with the funnel's classification inputs:
+    /// (id, ts, result_json, inferred_action).
+    pub fn advisory_facts(&self) -> Result<Vec<AdvisoryFactRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, ts, COALESCE(result_json,'[]'), inferred_action
+             FROM advisories WHERE tool = 'spot' ORDER BY ts ASC",
+        )?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
     /// Advisories awaiting outcome inference: (id, ts, result_json).
     pub fn pending_inferences(&self) -> Result<Vec<(String, i64, String)>> {
         let mut stmt = self.conn.prepare(
@@ -1111,24 +1254,26 @@ impl Store {
 }
 
 fn row_to_symbol(r: &rusqlite::Row<'_>) -> rusqlite::Result<Symbol> {
-    let simhash: i64 = r.get(10)?;
-    let sig_simhash: i64 = r.get(11)?;
-    let in_test: i64 = r.get(12)?;
+    let simhash: i64 = r.get(12)?;
+    let sig_simhash: i64 = r.get(13)?;
+    let in_test: i64 = r.get(14)?;
     Ok(Symbol {
         id: r.get(0)?,
         file_path: r.get(1)?,
         module: r.get(2)?,
-        language: r.get(3)?,
-        name: r.get(4)?,
-        kind: r.get(5)?,
-        start_byte: r.get(6)?,
-        end_byte: r.get(7)?,
-        body_hash: r.get(8)?,
-        struct_hash: r.get(9)?,
+        worktree: r.get(3)?,
+        worktree_branch: r.get(4)?,
+        language: r.get(5)?,
+        name: r.get(6)?,
+        kind: r.get(7)?,
+        start_byte: r.get(8)?,
+        end_byte: r.get(9)?,
+        body_hash: r.get(10)?,
+        struct_hash: r.get(11)?,
         simhash: simhash as u64,
         sig_simhash: sig_simhash as u64,
         in_test: in_test != 0,
-        commit_sha: r.get(13)?,
+        commit_sha: r.get(15)?,
     })
 }
 
@@ -1141,6 +1286,8 @@ mod tests {
             id: None,
             file_path: "src/lib.rs".into(),
             module: String::new(),
+            worktree: String::new(),
+            worktree_branch: String::new(),
             language: "rust".into(),
             name: name.into(),
             kind: "function_item".into(),

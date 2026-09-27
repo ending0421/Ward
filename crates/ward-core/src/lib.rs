@@ -17,6 +17,7 @@ pub mod envelope;
 pub mod ffi;
 pub mod fingerprint;
 pub mod fresh;
+pub mod funnel;
 pub mod git;
 pub mod index;
 pub mod infer;

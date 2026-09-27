@@ -124,11 +124,38 @@ fn collect_features_excluding(node: &Node, excluded: Node, out: &mut Vec<u64>) {
     if node.id() == excluded.id() {
         return;
     }
-    out.push(node_feature(node));
+    // Issue #15: the excluded subtree must ALSO vanish from its parent's
+    // children-list feature. Leaving it there made the indexed signature
+    // form (body present but excluded) differ from a body-less query — a
+    // verbatim copy scored ~0.89 against its own original instead of 1.0,
+    // so same-shape siblings could evict it from top_k.
+    out.push(node_feature_excluding(node, excluded));
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
         collect_features_excluding(&child, excluded, out);
     }
+}
+
+/// `node_feature` with one child omitted from the children list.
+fn node_feature_excluding(node: &Node, excluded: Node) -> u64 {
+    let parent = node
+        .parent()
+        .map(|p| p.kind().to_string())
+        .unwrap_or_default();
+    let mut f = String::with_capacity(64);
+    f.push_str(&parent);
+    f.push('|');
+    f.push_str(node.kind());
+    f.push('|');
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if child.id() == excluded.id() {
+            continue;
+        }
+        f.push_str(child.kind());
+        f.push(',');
+    }
+    feature_hash(&f)
 }
 
 /// L2: Charikar simhash over the feature multiset (multiplicity-weighted).

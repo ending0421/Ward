@@ -156,8 +156,46 @@ fn named_children_of<'a>(node: &'a Node, source: &str) -> impl Iterator<Item = N
     children.into_iter()
 }
 
-/// The signature's parameter type nodes (language-heuristic: each
-/// parameter's named children minus its leading name identifier).
+/// One parameter's TYPE node (issue #16).
+///
+/// Field accessors win when the grammar declares them (`type` is labelled
+/// in tree-sitter-rust/java/swift); Kotlin declares no fields, so the
+/// fallback drops the parameter's FIRST identifier-kind child (its name)
+/// and keeps everything after it — including a bare `type_identifier`
+/// type, which the old kind-heuristic silently deleted.
+fn parameter_type_node<'a>(param: &Node<'a>) -> Option<Node<'a>> {
+    if let Some(t) = param.child_by_field_name("type") {
+        return Some(t);
+    }
+    let mut cursor = param.walk();
+    let children: Vec<Node> = param.named_children(&mut cursor).collect();
+    let first_ident = children
+        .iter()
+        .position(|c| c.kind().contains("identifier"))
+        .unwrap_or(usize::MAX);
+    // Everything except the name slot is (part of) the type: a bare type,
+    // a reference, a generic — or a function type's pieces.
+    let rest: Vec<Node> = children
+        .into_iter()
+        .enumerate()
+        .filter(|(i, _)| *i != first_ident)
+        .map(|(_, c)| c)
+        .collect();
+    if rest.len() == 1 {
+        rest.into_iter().next()
+    } else if rest.is_empty() {
+        None
+    } else {
+        // Multiple nodes (e.g. Kotlin `(Long) -> Unit` pieces): hand back
+        // the container so classification sees them together. The caller
+        // keeps the whole vector, so return the first and let the caller
+        // widen; simplest correct choice here is the first node — the
+        // classification is recursive over its children anyway.
+        rest.into_iter().next()
+    }
+}
+
+/// The signature's parameter TYPE nodes, one per parameter.
 fn parameter_types<'a>(symbol: &Node<'a>, source: &str) -> Vec<Node<'a>> {
     let mut params: Vec<Node> = Vec::new();
     let mut cursor = symbol.walk();
@@ -165,24 +203,17 @@ fn parameter_types<'a>(symbol: &Node<'a>, source: &str) -> Vec<Node<'a>> {
         // tree-sitter-swift wraps body-less declarations in ERROR with the
         // parameter nodes attached to the wrapper itself.
         if child.kind() == "parameter" || child.kind() == "formal_parameter" {
-            params.push(child);
+            if let Some(t) = parameter_type_node(&child) {
+                params.push(t);
+            }
             continue;
         }
         if child.kind() == "parameters" || child.kind() == "function_value_parameters" {
             let mut pc = child.walk();
             for p in child.named_children(&mut pc) {
                 if p.kind() == "parameter" || p.kind() == "formal_parameter" {
-                    let mut tc = p.walk();
-                    let types: Vec<Node> = p
-                        .named_children(&mut tc)
-                        .filter(|c| {
-                            // skip the parameter NAME (first identifier-ish
-                            // child); everything else is part of the type
-                            !c.kind().contains("identifier") || c.child_count() > 0
-                        })
-                        .collect();
-                    if !types.is_empty() {
-                        params.extend(types);
+                    if let Some(t) = parameter_type_node(&p) {
+                        params.push(t);
                     }
                 }
             }
@@ -263,6 +294,47 @@ mod tests {
                 .abs()
                 < 1e-9
         );
+    }
+
+    #[test]
+    fn bare_identifier_types_are_counted() {
+        // Issue #16 discriminator matrix: a parameter whose type is a BARE
+        // identifier must count (the old filter deleted childless
+        // identifier-kind nodes, i.e. the type itself).
+        let cases: &[(&str, f64)] = &[
+            ("fn g5(x: &Canvas)", 1.0),
+            ("fn g2(a: u64, b: &ItemId)", 0.5),
+            ("fn f3(a: &Frame, b: f32)", 0.5),
+            ("fn g1(a: Frame, b: f32)", 0.5),
+            ("fn g4(x: Canvas)", 1.0),
+            ("fn f2(a: u64, b: ItemId)", 0.5),
+            ("fn g3(a: u64, b: ItemId, c: &Frame)", 2.0 / 3.0),
+            ("fn m1(&mut self, id: ItemId) -> Status", 1.0),
+        ];
+        for (sig, expected) in cases {
+            let got = signature_specificity(Language::Rust, sig)
+                .unwrap_or_else(|| panic!("{sig} must parse"));
+            assert!(
+                (got - expected).abs() < 1e-9,
+                "{sig}: expected {expected}, got {got}"
+            );
+        }
+    }
+
+    #[test]
+    fn wrapping_a_bare_type_does_not_change_the_ratio() {
+        // Wrapping must be neutral: same domain/total ratio either way.
+        let bare = signature_specificity(Language::Rust, "fn f(a: u64, b: ItemId) -> u8").unwrap();
+        let wrapped =
+            signature_specificity(Language::Rust, "fn f(a: u64, b: &ItemId) -> u8").unwrap();
+        assert!(
+            (bare - wrapped).abs() < 1e-9,
+            "bare={bare} wrapped={wrapped}"
+        );
+        let all_bare = signature_specificity(Language::Rust, "fn g(x: Canvas) -> u8").unwrap();
+        let all_wrapped =
+            signature_specificity(Language::Rust, "fn g(x: &mut Canvas) -> u8").unwrap();
+        assert!((all_bare - all_wrapped).abs() < 1e-9);
     }
 
     #[test]

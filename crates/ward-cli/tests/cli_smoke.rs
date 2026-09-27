@@ -372,6 +372,8 @@ fn stats_and_calibrate_report_from_seeded_data() {
         assert!(out.status.success());
         let cal: serde_json::Value =
             serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).unwrap();
+        // v0.4.1 envelope: payload lives under `data`.
+        let cal = &cal["data"];
         assert!(cal["total_verdicts"].as_i64().unwrap() >= 1);
         assert!(cal["note"].as_str().unwrap().contains("样本量不足"));
     }

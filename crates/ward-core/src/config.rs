@@ -82,6 +82,16 @@ impl Default for SandboxConfig {
     }
 }
 
+/// Indexer options.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct IndexConfig {
+    /// Index linked worktrees' new-vs-merge-base symbols with provenance
+    /// (issue #12): the duplication window between two unmerged worktrees
+    /// is otherwise invisible. Default off — opt in deliberately.
+    pub include_worktrees: bool,
+}
+
 /// FFI export-face options (0.5-3): the expected export face (a checked-in
 /// declaration header) and the built artifact to inspect.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -141,6 +151,7 @@ pub struct WardConfig {
     pub lint: LintConfig,
     pub sandbox: SandboxConfig,
     pub ffi: FfiConfig,
+    pub index: IndexConfig,
 }
 
 impl Default for WardConfig {
@@ -157,6 +168,7 @@ impl Default for WardConfig {
             lint: LintConfig::default(),
             sandbox: SandboxConfig::default(),
             ffi: FfiConfig::default(),
+            index: IndexConfig::default(),
         }
     }
 }

@@ -96,6 +96,77 @@ pub fn main_worktree(repo: &Path) -> Option<PathBuf> {
     None
 }
 
+/// All linked worktrees except `repo` itself: `(root, branch)` pairs from
+/// `git worktree list --porcelain` (issue #12).
+pub fn list_worktrees(repo: &Path) -> Result<Vec<(PathBuf, Option<String>)>> {
+    let out = std::process::Command::new("git")
+        .args(["worktree", "list", "--porcelain"])
+        .current_dir(repo)
+        .output()
+        .context("git worktree list")?;
+    if !out.status.success() {
+        return Ok(Vec::new());
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let repo_canon = repo.canonicalize().unwrap_or_else(|_| repo.to_path_buf());
+    let mut out_list = Vec::new();
+    let (mut root, mut branch): (Option<PathBuf>, Option<String>) = (None, None);
+    let mut flush = |root: &mut Option<PathBuf>, branch: &mut Option<String>| {
+        if let Some(r) = root.take() {
+            let canon = r.canonicalize().unwrap_or_else(|_| r.clone());
+            if canon != repo_canon {
+                out_list.push((r, branch.take()));
+            }
+        }
+        *branch = None;
+    };
+    // Entries are separated by a blank line and the LAST one has no trailing
+    // separator, so both the blank line and the end of output must flush.
+    for line in text.lines() {
+        if line.is_empty() {
+            flush(&mut root, &mut branch);
+        } else if let Some(p) = line.strip_prefix("worktree ") {
+            flush(&mut root, &mut branch);
+            root = Some(PathBuf::from(p));
+        } else if let Some(b) = line.strip_prefix("branch ") {
+            branch = Some(b.trim_start_matches("refs/heads/").to_string());
+        }
+    }
+    flush(&mut root, &mut branch);
+    Ok(out_list)
+}
+
+/// The merge base of `repo`'s HEAD and `other_sha`, if any.
+pub fn merge_base(repo: &Path, other_sha: &str) -> Option<String> {
+    let out = std::process::Command::new("git")
+        .args(["merge-base", "HEAD"])
+        .arg(other_sha)
+        .current_dir(repo)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let sha = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!sha.is_empty()).then_some(sha)
+}
+
+/// Paths with uncommitted changes (tracked modified/deleted + untracked).
+pub fn status_paths(repo: &Path) -> Vec<String> {
+    let Ok(out) = std::process::Command::new("git")
+        .args(["status", "--porcelain"])
+        .current_dir(repo)
+        .output()
+    else {
+        return Vec::new();
+    };
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| l.get(3..).map(|p| p.trim().trim_matches('"').to_string()))
+        .filter(|p| !p.is_empty())
+        .collect()
+}
+
 /// Commits between `sha` (exclusive) and HEAD: how far behind the index
 /// is. `None` when `sha` is unresolvable (e.g. shallow/detached noise).
 pub fn commits_behind(repo: &Path, sha: &str) -> Option<u64> {

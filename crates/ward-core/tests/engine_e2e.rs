@@ -677,6 +677,90 @@ fn replay_skips_non_code_files() {
 }
 
 #[test]
+fn verbatim_copy_matches_its_own_original() {
+    // Issue #15: the strongest duplication signal a gate can receive — a
+    // character-for-character copy — must surface the original, not be
+    // evicted by same-shape siblings.
+    let repo = TestRepo::new();
+    repo.write(
+        "src/original.rs",
+        "pub struct Frame { pub w: f32 }\n\npub fn unique_renderer_helper(frame: &Frame, scale: f32) -> f32 { frame.w * scale }\n",
+    );
+    // Same-shape siblings that used to outrank the true original.
+    repo.write(
+        "src/siblings.rs",
+        "pub fn other_a(a: &Frame, b: f32) -> f32 { 0.0 }\npub fn other_b(a: &Frame, b: f32) -> f32 { 1.0 }\npub fn other_c(a: &Frame, b: f32) -> f32 { 2.0 }\npub fn other_d(a: &Frame, b: f32) -> f32 { 3.0 }\n",
+    );
+    repo.commit_all("c1");
+    index::index_repo(repo.path(), &cfg()).unwrap();
+
+    let sig = "pub fn unique_renderer_helper(frame: &Frame, scale: f32) -> f32";
+    let full =
+        "pub fn unique_renderer_helper(frame: &Frame, scale: f32) -> f32 { frame.w * scale }";
+
+    // (1) signature-only query: the original must be the top match at ≥0.99.
+    let r = search::spot(
+        repo.path(),
+        &cfg(),
+        "copy check",
+        Some(sig),
+        None,
+        Some(Language::Rust),
+        &search::SpotOptions::default(),
+    )
+    .unwrap();
+    let top = r.matches.first().expect("matches");
+    assert_eq!(top.symbol, "unique_renderer_helper", "{:?}", r.matches);
+    assert!(
+        top.similarity >= 0.99,
+        "self-match must be ~1.0, got {:?}",
+        r.matches
+    );
+
+    // (2) full function as the signature: structural 1.0.
+    let r = search::spot(
+        repo.path(),
+        &cfg(),
+        "copy check",
+        Some(full),
+        None,
+        Some(Language::Rust),
+        &search::SpotOptions::default(),
+    )
+    .unwrap();
+    assert!(
+        r.matches
+            .iter()
+            .any(|m| m.symbol == "unique_renderer_helper"
+                && m.kind == "structural"
+                && m.similarity == 1.0),
+        "full-declaration query must hit L1: {:?}",
+        r.matches
+    );
+
+    // (3) body-less signature + exact body (the gate/hook shape): L1 too.
+    let r = search::spot(
+        repo.path(),
+        &cfg(),
+        "copy check",
+        Some(sig),
+        Some(full),
+        Some(Language::Rust),
+        &search::SpotOptions::default(),
+    )
+    .unwrap();
+    assert!(
+        r.matches
+            .iter()
+            .any(|m| m.symbol == "unique_renderer_helper"
+                && m.kind == "structural"
+                && m.similarity == 1.0),
+        "signature+body must hit L1: {:?}",
+        r.matches
+    );
+}
+
+#[test]
 fn unindexed_repo_answers_missing_and_never_creates_an_index() {
     // Issue #6: "not indexed" must be machine-readable and must NOT
     // auto-create an empty index that certifies absence.
@@ -775,6 +859,182 @@ fn linked_worktree_shares_the_main_checkout_index() {
         "shared index must answer: {:?}",
         r.matches
     );
+}
+
+#[test]
+fn worktree_only_symbols_are_collected_labelled_and_pruned() {
+    // Issue #12: a duplicate first authored inside a linked worktree was
+    // invisible to the main checkout's spot — the index only ever walked the
+    // main tree. It is now collectable on demand, labelled as unmerged, and
+    // never outlives the worktree it came from.
+    let repo = TestRepo::new();
+    repo.write(
+        "src/lib.rs",
+        "pub fn main_checkout_helper(a: u64) -> u64 { a }\n",
+    );
+    repo.commit_all("c1");
+    index::index_repo(repo.path(), &cfg()).unwrap();
+
+    let wt_root = repo.path().parent().unwrap().join(format!(
+        "{}-wt12",
+        repo.path().file_name().unwrap().to_string_lossy()
+    ));
+    let out = std::process::Command::new("git")
+        .args(["worktree", "add", "-q", "-b", "wt12branch"])
+        .arg(&wt_root)
+        .current_dir(repo.path())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // (a) committed-in-worktree new file, (b) untracked worktree-local file.
+    std::fs::create_dir_all(wt_root.join("src")).unwrap();
+    std::fs::write(
+        wt_root.join("src/dup.rs"),
+        "pub fn worktree_only_dup(a: u64, b: ItemId) -> u64 { a }\npub struct ItemId(pub u64);\n",
+    )
+    .unwrap();
+    let st = std::process::Command::new("git")
+        .args(["add", "src/dup.rs"])
+        .current_dir(&wt_root)
+        .output()
+        .unwrap();
+    assert!(st.status.success());
+    let ci = std::process::Command::new("git")
+        .args([
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-q",
+            "-m",
+            "worktree commit",
+        ])
+        .current_dir(&wt_root)
+        .output()
+        .unwrap();
+    assert!(
+        ci.status.success(),
+        "{}",
+        String::from_utf8_lossy(&ci.stderr)
+    );
+    std::fs::write(
+        wt_root.join("src/scratch.rs"),
+        "pub fn worktree_scratch_fn(a: u64, b: ItemId) -> u64 { a }\n",
+    )
+    .unwrap();
+
+    let mut cfg_wt = cfg();
+    cfg_wt.index.include_worktrees = true;
+    let report = index::index_repo(repo.path(), &cfg_wt).unwrap();
+    assert!(
+        report.worktree_files_indexed >= 2,
+        "committed + untracked worktree files must both be collected: {report:?}"
+    );
+    assert!(report.worktree_symbols_indexed >= 2, "{report:?}");
+
+    // A query from the MAIN checkout sees the unmerged duplicate, and says so.
+    let q = "pub fn worktree_only_dup(a: u64, b: ItemId) -> u64";
+    let r = search::spot(
+        repo.path(),
+        &cfg(),
+        "worktree duplicate",
+        Some(q),
+        None,
+        Some(Language::Rust),
+        &search::SpotOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        r.worktree_symbols, 3,
+        "dup.rs (fn + struct) and scratch.rs carry provenance: {r:?}"
+    );
+    let hit = r
+        .matches
+        .iter()
+        .find(|m| m.symbol == "worktree_only_dup")
+        .unwrap_or_else(|| panic!("worktree-only symbol must be found: {:?}", r.matches));
+    assert!(
+        !hit.worktree.is_empty(),
+        "provenance root required: {hit:?}"
+    );
+    assert_eq!(hit.worktree_branch, "wt12branch", "{hit:?}");
+    assert!(
+        hit.note.contains("wt12branch") && hit.note.contains("未合并来源"),
+        "the branch must be named in the note: {hit:?}"
+    );
+    assert!(hit.similarity >= 0.92, "{hit:?}");
+    assert_ne!(hit.lines, "?", "coordinates resolve at the worktree root");
+    assert_eq!(hit.path, "src/dup.rs", "path stays repo-relative: {hit:?}");
+
+    // The UNTRACKED worktree-local file is collected too (status, not history).
+    let r_scratch = search::spot(
+        repo.path(),
+        &cfg(),
+        "worktree scratch",
+        Some("pub fn worktree_scratch_fn(a: u64, b: ItemId) -> u64"),
+        None,
+        Some(Language::Rust),
+        &search::SpotOptions::default(),
+    )
+    .unwrap();
+    let s_hit = r_scratch
+        .matches
+        .iter()
+        .find(|m| m.symbol == "worktree_scratch_fn")
+        .unwrap_or_else(|| panic!("untracked worktree file must be found: {r_scratch:?}"));
+    assert!(!s_hit.worktree.is_empty(), "{s_hit:?}");
+    assert!(s_hit.similarity >= 0.92, "{s_hit:?}");
+    // Unmerged provenance must NOT make every advisory look stale: the file
+    // is hashed at its own root under its own key.
+    assert!(!r.stale, "worktree content is its own baseline: {r:?}");
+
+    // Flag off ⇒ provenance is unwanted state, purged rather than lingering.
+    index::index_repo(repo.path(), &cfg()).unwrap();
+    let r2 = search::spot(
+        repo.path(),
+        &cfg(),
+        "worktree duplicate",
+        Some(q),
+        None,
+        Some(Language::Rust),
+        &search::SpotOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(r2.worktree_symbols, 0);
+    assert!(!r2.matches.iter().any(|m| m.symbol == "worktree_only_dup"));
+
+    // Deleted worktree ⇒ nothing to collect and nothing left behind.
+    index::index_repo(repo.path(), &cfg_wt).unwrap();
+    let rm = std::process::Command::new("git")
+        .args(["worktree", "remove", "--force"])
+        .arg(&wt_root)
+        .current_dir(repo.path())
+        .output()
+        .unwrap();
+    assert!(
+        rm.status.success(),
+        "{}",
+        String::from_utf8_lossy(&rm.stderr)
+    );
+    let report3 = index::index_repo(repo.path(), &cfg_wt).unwrap();
+    assert_eq!(report3.worktree_files_indexed, 0, "{report3:?}");
+    let r3 = search::spot(
+        repo.path(),
+        &cfg(),
+        "worktree duplicate",
+        Some(q),
+        None,
+        Some(Language::Rust),
+        &search::SpotOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(r3.worktree_symbols, 0, "dead provenance must be pruned");
+    assert!(!r3.matches.iter().any(|m| m.symbol == "worktree_only_dup"));
 }
 
 #[test]
@@ -1545,6 +1805,8 @@ fn store_rebuilds_on_schema_version_mismatch() {
                     id: None,
                     file_path: "lib.rs".into(),
                     module: String::new(),
+                    worktree: String::new(),
+                    worktree_branch: String::new(),
                     language: "rust".into(),
                     name: "f".into(),
                     kind: "function_item".into(),
@@ -1623,6 +1885,8 @@ fn schema_rebuild_preserves_governance_data() {
                     id: None,
                     file_path: "lib.rs".into(),
                     module: String::new(),
+                    worktree: String::new(),
+                    worktree_branch: String::new(),
                     language: "rust".into(),
                     name: "f".into(),
                     kind: "function_item".into(),
@@ -1685,6 +1949,75 @@ fn schema_rebuild_preserves_governance_data() {
         store.advisory_payloads().unwrap().len(),
         1,
         "advisories survive the rebuild"
+    );
+}
+
+#[test]
+fn v8_index_upgrades_in_place_on_open() {
+    // Issue #12 regression: the schema rebuild used to run AFTER the DDL, so
+    // opening a v8 index failed with "no such column: worktree" instead of
+    // rebuilding — a real user's first `ward index` after upgrading.
+    let repo = TestRepo::new();
+    repo.write("lib.rs", "pub fn f() {}\n");
+    repo.commit_all("c1");
+    let db_path = Store::default_path(repo.path());
+    {
+        let store = Store::open(&db_path).unwrap();
+        store
+            .record_ack(&ward_core::store::Ack {
+                id: None,
+                new_symbol: "g".into(),
+                hit_symbol: "f".into(),
+                hit_path: Some("lib.rs".into()),
+                reason: "kept across the upgrade".into(),
+                advisory_id: Some("adv1".into()),
+                kind: "ack".into(),
+                ts: 7,
+            })
+            .unwrap();
+        assert_eq!(store.ack_count().unwrap(), 1);
+    }
+    {
+        // Forge a v8 index: same tables, minus the worktree provenance
+        // columns, stamped 8.
+        use rusqlite::Connection;
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "DROP TABLE symbols;
+             CREATE TABLE symbols (
+                 id INTEGER PRIMARY KEY,
+                 file_path TEXT NOT NULL,
+                 module TEXT NOT NULL DEFAULT '',
+                 language TEXT NOT NULL,
+                 name TEXT NOT NULL,
+                 kind TEXT NOT NULL,
+                 start_byte INTEGER NOT NULL,
+                 end_byte INTEGER NOT NULL,
+                 body_hash TEXT NOT NULL,
+                 struct_hash TEXT NOT NULL,
+                 simhash INTEGER NOT NULL,
+                 sig_simhash INTEGER NOT NULL,
+                 in_test INTEGER NOT NULL DEFAULT 0,
+                 commit_sha TEXT NOT NULL
+             );
+             UPDATE meta SET value = '8' WHERE key = 'schema_version';",
+        )
+        .unwrap();
+    }
+    let store = Store::open(&db_path).unwrap();
+    assert!(
+        store.all_symbols().unwrap().is_empty(),
+        "derived data wiped"
+    );
+    assert_eq!(
+        store.ack_count().unwrap(),
+        1,
+        "governance survives exactly once (no duplicated copy-back)"
+    );
+    assert_eq!(
+        store.all_acks().unwrap().first().map(|a| a.ts),
+        Some(7),
+        "the carried-over decision is the same one"
     );
 }
 

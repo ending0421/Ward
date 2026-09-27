@@ -215,6 +215,8 @@ mod tests {
             id: None,
             file_path: path.into(),
             module: String::new(),
+            worktree: String::new(),
+            worktree_branch: String::new(),
             language: "rust".into(),
             name: name.into(),
             kind: "function_item".into(),

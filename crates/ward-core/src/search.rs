@@ -41,6 +41,15 @@ pub struct SpotMatch {
     /// domain-typed params. Legacy payloads deserialize to 0.0.
     #[serde(default)]
     pub specificity: f64,
+    /// Absolute linked-worktree root the hit was indexed from (issue #12);
+    /// empty for main-checkout hits. `path` stays repo-relative, so a hit
+    /// with provenance is by construction not yet merged (nor committed).
+    #[serde(default)]
+    pub worktree: String,
+    /// Branch checked out in that worktree (issue #12): the readable name of
+    /// the line of work the unmerged duplicate belongs to.
+    #[serde(default)]
+    pub worktree_branch: String,
     pub note: String,
 }
 
@@ -106,6 +115,11 @@ pub struct SpotResult {
     /// lack it and deserialize to `None`).
     #[serde(default)]
     pub query: Option<String>,
+    /// Symbols in this index that come from LINKED WORKTREES (issue #12):
+    /// `path` for those hits is relative to `match.worktree`, and their
+    /// content is by definition unmerged. Zero when no worktree is indexed.
+    #[serde(default)]
+    pub worktree_symbols: u64,
 }
 
 /// Advisory grade, with the discipline that text-only evidence can never be
@@ -253,11 +267,11 @@ impl Bm25 {
 
 /// The matched symbol's own signature specificity (issue #5): parsed from
 /// the hit file on demand — only for the few kept matches.
-fn symbol_specificity(repo: &Path, m: &SpotMatch) -> f64 {
+fn symbol_specificity(root: &Path, m: &SpotMatch) -> f64 {
     let Some(lang) = Language::from_path(Path::new(&m.path)) else {
         return 0.0;
     };
-    let Ok(source) = std::fs::read_to_string(repo.join(&m.path)) else {
+    let Ok(source) = std::fs::read_to_string(root.join(&m.path)) else {
         return 0.0;
     };
     // Best-effort: the declaration usually starts on the first match line
@@ -270,6 +284,16 @@ fn symbol_specificity(repo: &Path, m: &SpotMatch) -> f64 {
         .unwrap_or(1);
     let line = source.lines().nth(line_no.saturating_sub(1)).unwrap_or("");
     crate::specificity::signature_specificity(lang, line).unwrap_or(0.0)
+}
+
+/// Root a hit's coordinates resolve against: the main checkout, or the
+/// linked worktree it was indexed from (issue #12).
+fn root_of(repo: &Path, worktree: &str) -> std::path::PathBuf {
+    if worktree.is_empty() {
+        repo.to_path_buf()
+    } else {
+        std::path::PathBuf::from(worktree)
+    }
 }
 
 fn line_range(path: &Path, start_byte: i64, end_byte: i64) -> String {
@@ -336,6 +360,29 @@ pub fn parse_query_language(
     tolerant
 }
 
+/// Parse a snippet that is a COMPLETE declaration (body included) — the
+/// authoritative fingerprint source when a gate passes the whole function
+/// as `--body` (issue #15: a body-less signature can only reach the
+/// simhash path, so an exact copy never hit L1).
+fn parse_complete_declaration(
+    text: &str,
+    language: Option<Language>,
+) -> Option<(Language, tree_sitter::Tree)> {
+    let (lang, tree) = parse_query_language(text, language)?;
+    let aliased = {
+        let root = tree.root_node();
+        let mut cursor = root.walk();
+        let first = root.named_children(&mut cursor).next()?;
+        lang.spec()
+            .query_alias
+            .is_some_and(|(from, _)| first.kind() == from)
+    };
+    if aliased {
+        return None; // body-less: the alias kind marks a signature-only parse
+    }
+    Some((lang, tree))
+}
+
 /// Run the full Spot pipeline and record the advisory.
 ///
 /// The store is opened query-side: never auto-created (issue #6), linked
@@ -373,6 +420,7 @@ pub fn spot(
         query_specificity: 0.0,
         low_confidence: false,
         query: Some(intent.to_string()),
+        worktree_symbols: 0,
     };
 
     // Issue #8 fast path: low specificity is decidable from the signature
@@ -423,7 +471,13 @@ pub fn spot(
 
     // Layer 1: exact structural equality (L1) when the signature parses —
     // in any supported language, not just Rust.
-    let parsed = proposed_signature.and_then(|sig| parse_query_language(sig, language));
+    // Issue #15: prefer a complete declaration for the fingerprint source —
+    // gates/hooks pass the full function as `--body`, and using it makes an
+    // exact copy hit L1 (structural, sim 1.0) instead of a weakened near.
+    let fingerprint_text = proposed_body
+        .filter(|body| parse_complete_declaration(body, language).is_some())
+        .or(proposed_signature);
+    let parsed = fingerprint_text.and_then(|sig| parse_query_language(sig, language));
     let query_struct = parsed.as_ref().and_then(|(lang, t)| {
         // Node-level form: the stored struct_hash covers the symbol node,
         // not the whole tree (whose root wrapper would never match).
@@ -439,7 +493,7 @@ pub fn spot(
     // Issue #5: low-specificity signatures (all basic/std param types)
     // degenerate to shape-only fingerprints and flood false positives.
     // Compute the specificity once and expose it + the gate flag.
-    let query_specificity = proposed_signature
+    let query_specificity = fingerprint_text
         .and_then(|sig| {
             parsed
                 .as_ref()
@@ -469,11 +523,17 @@ pub fn spot(
             matches.push(SpotMatch {
                 path: sym.file_path.clone(),
                 scope: sym.module.clone(),
-                lines: line_range(&repo.join(&sym.file_path), sym.start_byte, sym.end_byte),
+                lines: line_range(
+                    &root_of(repo, &sym.worktree).join(&sym.file_path),
+                    sym.start_byte,
+                    sym.end_byte,
+                ),
                 symbol: sym.name.clone(),
                 similarity: 1.0,
                 specificity: 0.0,
                 kind: "structural".into(),
+                worktree: sym.worktree.clone(),
+                worktree_branch: sym.worktree_branch.clone(),
                 note: "结构全等（归一化后）：克隆/纯改名/字面量替换".into(),
             });
         }
@@ -521,11 +581,17 @@ pub fn spot(
                     SpotMatch {
                         path: sym.file_path.clone(),
                         scope: sym.module.clone(),
-                        lines: line_range(&repo.join(&sym.file_path), sym.start_byte, sym.end_byte),
+                        lines: line_range(
+                            &root_of(repo, &sym.worktree).join(&sym.file_path),
+                            sym.start_byte,
+                            sym.end_byte,
+                        ),
                         symbol: sym.name.clone(),
                         similarity: sim,
                         kind: "near".into(),
                         specificity: 0.0,
+                        worktree: sym.worktree.clone(),
+                        worktree_branch: sym.worktree_branch.clone(),
                         note: String::new(),
                     },
                     sim,
@@ -566,7 +632,7 @@ pub fn spot(
                             path: sym.file_path.clone(),
                             scope: sym.module.clone(),
                             lines: line_range(
-                                &repo.join(&sym.file_path),
+                                &root_of(repo, &sym.worktree).join(&sym.file_path),
                                 sym.start_byte,
                                 sym.end_byte,
                             ),
@@ -574,6 +640,8 @@ pub fn spot(
                             similarity: sim,
                             kind: "textual".into(),
                             specificity: 0.0,
+                            worktree: sym.worktree.clone(),
+                            worktree_branch: sym.worktree_branch.clone(),
                             note: String::new(),
                         },
                         sim,
@@ -600,8 +668,27 @@ pub fn spot(
             m.kind = "consumed".into();
             m.note = "本次编辑消费/整合该符号（--consumes）：信息性提示".into();
         }
+        if !m.worktree.is_empty() {
+            // Issue #12: an unmerged source is not a false positive — it is
+            // a real duplicate that has not landed yet. Say so explicitly so
+            // the reader does not hunt for it in the main checkout.
+            let dir = Path::new(&m.worktree)
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| m.worktree.clone());
+            let label = if m.worktree_branch.is_empty() {
+                dir
+            } else {
+                format!("{dir}@{}", m.worktree_branch)
+            };
+            m.note = if m.note.is_empty() {
+                format!("未合并来源（worktree {label}）（#12）")
+            } else {
+                format!("{}；未合并来源（worktree {label}）（#12）", m.note)
+            };
+        }
         if g != Grade::Filtered {
-            m.specificity = symbol_specificity(repo, &m);
+            m.specificity = symbol_specificity(&root_of(repo, &m.worktree), &m);
             matches.push(m);
         }
         if matches.len() >= config.top_k {
@@ -635,6 +722,8 @@ pub fn spot(
                             similarity: best,
                             kind: "block".into(),
                             specificity: 0.0,
+                            worktree: String::new(),
+                            worktree_branch: String::new(),
                             note: "函数内语句块窗口高度相似（块级指纹）".into(),
                         },
                         best,
@@ -653,10 +742,13 @@ pub fn spot(
         }
     }
 
-    let fresh = crate::fresh::check(
+    let fresh = crate::fresh::check_scoped(
         repo,
         &store,
-        &matches.iter().map(|m| m.path.clone()).collect::<Vec<_>>(),
+        &matches
+            .iter()
+            .map(|m| (m.path.as_str(), m.worktree.as_str()))
+            .collect::<Vec<_>>(),
     )?;
 
     // Issue #7: freshness severity — commits behind HEAD, and (when a
@@ -692,7 +784,10 @@ pub fn spot(
         // Coordinates in a stale advisory are historical: flag hits whose
         // files no longer exist at HEAD.
         for m in &mut matches {
-            if !m.path.is_empty() && !crate::git::exists_at_head(repo, &m.path) {
+            if m.worktree.is_empty()
+                && !m.path.is_empty()
+                && !crate::git::exists_at_head(repo, &m.path)
+            {
                 m.note.push_str("；该命中在 HEAD 已删除（坐标历史）");
             }
         }
@@ -728,6 +823,7 @@ pub fn spot(
         query_specificity,
         low_confidence,
         query: Some(intent.to_string()),
+        worktree_symbols: symbols.iter().filter(|s| !s.worktree.is_empty()).count() as u64,
     };
     // Issue #10: record convergence events (consumed hits) in the registry.
     if let Some(consumed) = options.consumes.as_deref() {
@@ -783,6 +879,7 @@ pub fn parse_spot_payload(json: &str) -> Option<SpotResult> {
         query_specificity: 0.0,
         low_confidence: false,
         query: None,
+        worktree_symbols: 0,
     })
 }
 
@@ -820,6 +917,8 @@ mod tests {
                 id: None,
                 file_path: "a.rs".into(),
                 module: String::new(),
+                worktree: String::new(),
+                worktree_branch: String::new(),
                 language: "rust".into(),
                 name: "debounce".into(),
                 kind: "function_item".into(),
@@ -836,6 +935,8 @@ mod tests {
                 id: None,
                 file_path: "b.rs".into(),
                 module: String::new(),
+                worktree: String::new(),
+                worktree_branch: String::new(),
                 language: "rust".into(),
                 name: "quicksort".into(),
                 kind: "function_item".into(),

@@ -225,6 +225,8 @@ mod tests {
             id: None,
             file_path: "src/lib.rs".into(),
             module: String::new(),
+            worktree: String::new(),
+            worktree_branch: String::new(),
             language: "rust".into(),
             name: "debounce".into(),
             kind: "function_item".into(),
