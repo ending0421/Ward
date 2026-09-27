@@ -128,7 +128,7 @@ HIGH 风险标记：绑定是生成物，必须重新生成并人审。
 结果 JSON 带 `index_state`/`stale_severe`/`stale_commits` 供机器判读）。
 gate 消费方应把 3 当"先刷新索引再放行"，绝不能当"无重复"。
 
-**边界契约速查（v0.8.0）**：
+**边界契约速查（v0.9.0）**：
 - `spot` 不再自动建索引；linked worktree 无自有索引时自动共享主 checkout
   的索引（`index_shared_from` 指明来源）；
 - `--quick`：低特异度签名不碰索引直接回答（`quick: true`）；低特异度谓词
@@ -149,7 +149,14 @@ gate 消费方应把 3 当"先刷新索引再放行"，绝不能当"无重复"�
   worktree 删除后条目自动清理；不带开关的索引会清空 provenance
   （hook 始终带开关，静默路径无需人工）；
 - 转化率报表（#13）：`ward stats --funnel` 输出 `acked/reused/rewritten/
-  pending/abandoned` 分桶与周 cohort 转化率。
+  pending/abandoned` 分桶与周 cohort 转化率；
+- **拒绝作答的载荷自证拒绝（#17）**：exit 3 时 `ok: false` + `error` 说明原因，
+  且 `low_confidence` / `query_specificity` **字段缺失**（不是 `false`/`0.0`）；
+  载荷级标记 `cannot_answer: true`。门禁只读退出码 / `ok` / `cannot_answer`，
+  绝不读 `matches`/`low_confidence`；`spot-file` 报告新增
+  `index_state: missing|empty|fresh|stale|unchecked`，fail-open 与"本次没新增符号"
+  不再同形。verdict 类命令（form-check/catch-run --full/compat-check）保持不变：
+  载荷即答案（`verdict`），`ok` 仍为 true，退出码 1/2 与之对应。
 
 ## 5. 与 Claude Code / Codex 协作
 

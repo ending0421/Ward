@@ -69,7 +69,7 @@ jobs:
       - name: Build ward
         run: cargo build --release -p ward-cli
       - name: Form-check the active task spec (fail-closed; api_compat adjudicated here)
-        run: ./target/release/ward form-check --repo . --spec specs/2026-09-m1-recall-fidelity.md --ci
+        run: ./target/release/ward form-check --repo . --spec specs/2026-09-spot-refusal-payload.md --ci
 
   jvm-smoke:
     name: jvm smoke (real binary-compatibility-validator via gradlew apiCheck)

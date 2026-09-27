@@ -1,4 +1,4 @@
-# Ward 交付验收清单（v0.8.0 实测版）
+# Ward 交付验收清单（v0.9.0 实测版）
 
 对照设计规格 `docs/ward-tech-spec-v0.6.1.md` 的逐项实现核对。
 （历史版本：v0.1.0 / v0.4.0 版数字见 git 历史。）
@@ -15,13 +15,13 @@
 | M6 整合重构 | 离线重复簇聚类 + 合并建议（PR 由人提交） | ✅ 完整（分析半部分；PR 创建按 P2 由人执行） |
 | 语言矩阵 | Rust/Kotlin/Swift/Java/ObjC + **UDL** + **模块作用域** | ✅ 五语法 + UDL 薄提取器；构建产物/清单文件默认忽略 |
 | 治理数据闭环 | 推断采纳通道 + 黄金集标注 + Wilson 校准 + 快照/报表 + 双标一致性（Fleiss κ）+ **转化率漏斗（#13）** | ✅ 完整（`ward stats --funnel`：acked/reused/rewritten/pending/abandoned 分桶与周 cohort） |
-| 基础设施 | hooks、CI（含 jvm-smoke 真 validator / apple-smoke 真 digester）、回滚、性能基准、CLI/MCP JSON 信封统一（#4）、边界契约（#6-#11）、**召回保真（#12-#16：worktree provenance/逐字复制自匹配/裸类型特异度/漏斗/MCP ack+infer）** | ✅ 完整 |
+| 基础设施 | hooks、CI（含 jvm-smoke 真 validator / apple-smoke 真 digester）、回滚、性能基准、CLI/MCP JSON 信封统一（#4）、边界契约（#6-#11）、召回保真（#12-#16）、**拒绝作答的载荷自证拒绝（#17：cannot_answer/ok:false/缺席字段/spot-file index_state）** | ✅ 完整 |
 
 ## 2. 质量门禁（实测数字）
 
 | 指标 | 值 |
 | :--- | :--- |
-| 测试总数 | 258（2 bench + 11 CLI smoke + 188 lib unit + 56 e2e + 1 doc） |
+| 测试总数 | 262（2 bench + 12 CLI smoke + 189 lib unit + 58 e2e + 1 doc） |
 | clippy | `-D warnings` 零告警 |
 | rustfmt | 干净 |
 | 覆盖率（workspace） | 85.6% 行（CI llvm-cov 实测，门禁 ≥85%；本地 85.7%） |
@@ -42,5 +42,6 @@
 
 - 仓库：`git@github.com:ending0421/Ward.git`，分支 `master`；
 - 最小颗粒度提交：180+ 次（AI 提交带 `[ai]` 标记 + Co-authored-by）；
-- 版本纪律：0.x 的 minor 位承担"破坏性变更"语义（0.7.0 边界契约、0.8.0 召回保真），
-  patch 位仅 hotfix；契约字段只增不改，且同一批次的破坏性变更与版本号同一次提交落地。
+- 版本纪律：0.x 的 minor 位承担"破坏性变更"语义（0.7.0 边界契约、0.8.0 召回保真、
+  0.9.0 拒绝作答载荷），patch 位仅 hotfix；契约字段只增不改，且同一批次的破坏性变更
+  与版本号同一次提交落地。

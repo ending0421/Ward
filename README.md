@@ -186,24 +186,34 @@ basic/std param types — issue #5) degrade to shape-only matches: they are
 returned for humans but flagged `low_confidence` and never graded Strong,
 so automated gates can ignore them by construction.
 
-## Consumer boundary contract (v0.8.0)
+## Consumer boundary contract (v0.9.0)
 
 Gates consume `spot` as JSON + exit codes — silence must never mean absence:
 
 | Signal | Meaning |
 | :--- | :--- |
 | `index_state: "missing"/"empty"` + exit 3 | no index / empty index — **not** "no duplicates" |
+| `cannot_answer: true` + `ok: false` | the payload is a REFUSAL, not an answer: `low_confidence`/`query_specificity` are **absent** (never computed), on `spot --json` and on the MCP `spot` envelope alike (issue #17) |
 | `stale_severe: true` + exit 3 | staleness floor exceeded (`--max-staleness-*`) — refresh first |
 | `repo_root` / `index_shared_from` | absolute root of `match.path`; worktree sharing source |
 | `quick: true` | answered by the `--quick` fast path (index untouched) |
 | `low_confidence: true` | low-specificity signature — never Strong |
 | ack registry | `ward ack --against <hit>`; hits acked once stay suppressed (`--show-acked`) |
 | `--consumes <symbol>` | consolidation edits demote to `kind: consumed` |
+| `spot-file.index_state` | `missing`/`empty`/`fresh`/`stale`/`unchecked` — a fail-open report and "this write introduced nothing new" are never identical |
 | `worktree` / `worktree_branch` | hit was collected from that LINKED WORKTREE (unmerged source); `match.path` is relative to it |
 | `worktree_symbols` | how many indexed symbols carry worktree provenance (0 = none collected) |
 
 `ward setup-hooks` chains (never clobbers) an existing post-commit
 (`post-commit.pre-ward`, restore on `--remove`).
+
+**Reading a refusal (issue #17).** Gate on the exit code, `ok`, or
+`cannot_answer` — never on `matches`/`low_confidence`: on a cannot-answer the
+two computed fields are absent rather than `false`/`0.0`, and `ok` is `false`
+with the reason in `error`. Verdict-bearing commands are different in kind:
+`form-check` / `catch-run --full` / `compat-check` keep `ok: true` because
+their payload *is* the answer (`verdict: fail|unknown` is a computed result),
+with exit 1/2 mirroring it — read their `verdict`, not `ok`.
 
 Worktree provenance is opt-in for manual runs (`ward index
 --include-worktrees`, or `[index] include_worktrees = true`): collection only
